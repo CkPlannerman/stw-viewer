@@ -250,45 +250,103 @@ void main() {
 // Splat file loader
 // ============================================================
 
+async function fetchWithProgress(url, loadingBar, loadingText, label, offsetBytes, totalBytes) {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`HTTP ${response.status} fetching ${url}`);
+    const contentLength = +response.headers.get("Content-Length") || 0;
+    const reader = response.body.getReader();
+    const chunks = [];
+    let received = 0;
+
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.length;
+        if (totalBytes > 0) {
+            const pct = ((offsetBytes + received) / totalBytes * 100).toFixed(0);
+            loadingBar.style.width = `${pct}%`;
+            loadingText.textContent = `${label} ${pct}%`;
+        }
+    }
+
+    const result = new Uint8Array(received);
+    let off = 0;
+    for (const chunk of chunks) {
+        result.set(chunk, off);
+        off += chunk.length;
+    }
+    return result;
+}
+
 async function loadSplatFile(urlOrFile) {
-    let buffer;
     const loadingBar = document.getElementById("loading-bar");
     const loadingText = document.getElementById("loading-text");
 
     if (urlOrFile instanceof File) {
         loadingText.textContent = `Loading ${urlOrFile.name}...`;
-        buffer = await urlOrFile.arrayBuffer();
+        const buffer = await urlOrFile.arrayBuffer();
         loadingBar.style.width = "100%";
-    } else {
-        loadingText.textContent = "Loading splat data...";
-        const response = await fetch(urlOrFile);
-        const contentLength = +response.headers.get("Content-Length") || 0;
-        const reader = response.body.getReader();
-        const chunks = [];
-        let received = 0;
-
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            chunks.push(value);
-            received += value.length;
-            if (contentLength > 0) {
-                const pct = (received / contentLength * 100).toFixed(0);
-                loadingBar.style.width = `${pct}%`;
-                loadingText.textContent = `Loading splat data... ${pct}%`;
-            }
-        }
-
-        buffer = new Uint8Array(received);
-        let offset = 0;
-        for (const chunk of chunks) {
-            buffer.set(chunk, offset);
-            offset += chunk.length;
-        }
-        buffer = buffer.buffer;
+        return parseSplatBuffer(buffer);
     }
 
-    return parseSplatBuffer(buffer);
+    // Try loading as single file first
+    loadingText.textContent = "Loading splat data...";
+    try {
+        const headResp = await fetch(urlOrFile, { method: "HEAD" });
+        if (headResp.ok) {
+            const data = await fetchWithProgress(urlOrFile, loadingBar, loadingText,
+                "Loading splat data...", 0, +headResp.headers.get("Content-Length") || 0);
+            return parseSplatBuffer(data.buffer);
+        }
+    } catch (e) {
+        // Single file failed, try chunked loading below
+    }
+
+    // Try chunked loading: url.000, url.001, ...
+    loadingText.textContent = "Loading splat chunks...";
+    const chunkBuffers = [];
+    let totalSize = 0;
+
+    // First, probe how many chunks exist by HEAD requests
+    const chunkSizes = [];
+    for (let i = 0; i < 100; i++) {
+        const chunkUrl = `${urlOrFile}.${String(i).padStart(3, '0')}`;
+        try {
+            const head = await fetch(chunkUrl, { method: "HEAD" });
+            if (!head.ok) break;
+            chunkSizes.push({ url: chunkUrl, size: +head.headers.get("Content-Length") || 0 });
+        } catch (e) { break; }
+    }
+
+    if (chunkSizes.length === 0) {
+        throw new Error("Could not load splat data (no file or chunks found)");
+    }
+
+    const grandTotal = chunkSizes.reduce((s, c) => s + c.size, 0);
+    let loaded = 0;
+
+    for (let i = 0; i < chunkSizes.length; i++) {
+        const { url, size } = chunkSizes[i];
+        const data = await fetchWithProgress(url, loadingBar, loadingText,
+            `Loading chunk ${i + 1}/${chunkSizes.length}...`, loaded, grandTotal);
+        chunkBuffers.push(data);
+        loaded += data.length;
+    }
+
+    // Concatenate all chunks
+    const combined = new Uint8Array(loaded);
+    let offset = 0;
+    for (const buf of chunkBuffers) {
+        combined.set(buf, offset);
+        offset += buf.length;
+    }
+
+    return parseSplatBuffer(combined.buffer);
+}
+
+async function loadSplatChunked(baseName) {
+    return loadSplatFile(baseName);
 }
 
 
@@ -1274,16 +1332,18 @@ async function init() {
         intro.radialProgress = (morphSlider.value / 100) * 2.2;
     });
 
-    // Auto-load: check URL param first, then try default file
+    // Auto-load: check URL param first, then try default file, then try chunks
     const params = new URLSearchParams(window.location.search);
     const splatUrl = params.get("url");
     if (splatUrl) {
         loadAndDisplay(splatUrl);
     } else {
-        // Try loading default .splat file from same directory
+        // Try single file first, then chunked
         fetch("STW-SCAN.splat", { method: "HEAD" }).then(r => {
             if (r.ok) loadAndDisplay("STW-SCAN.splat");
-            else document.getElementById("loading-text").textContent = "Drop a .splat file to view";
+            else return fetch("STW-SCAN.splat.000", { method: "HEAD" });
+        }).then(r => {
+            if (r && r.ok) loadAndDisplay("STW-SCAN.splat");
         }).catch(() => {
             document.getElementById("loading-text").textContent = "Drop a .splat file to view";
         });
