@@ -1131,24 +1131,26 @@ class IntroAnimation {
         this.radialProgress = 0;
     }
 
-    start() {
+    start(skipDelay = false) {
         this.active = true;
         this.startTime = performance.now();
         this.radialProgress = 0;
+        this._delay = skipDelay ? 0 : this.morphDelay;
     }
 
     update() {
         if (!this.active) return;
         const elapsed = (performance.now() - this.startTime) / 1000;
 
-        if (elapsed > this.morphDelay) {
-            const morphElapsed = elapsed - this.morphDelay;
+        const delay = this._delay !== undefined ? this._delay : this.morphDelay;
+        if (elapsed > delay) {
+            const morphElapsed = elapsed - delay;
             let t = Math.min(1, morphElapsed / this.morphDuration);
             t = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
             this.radialProgress = t * 2.2;
         }
 
-        if (elapsed > this.morphDelay + this.morphDuration + 0.5) {
+        if (elapsed > delay + this.morphDuration + 0.5) {
             this.radialProgress = 2.2;
             this.active = false;
         }
@@ -1256,7 +1258,7 @@ async function init() {
     playBtn.addEventListener("click", () => {
         if (intro.radialProgress >= 2) {
             intro.radialProgress = 0;
-            intro.start();
+            intro.start(true); // skip delay on manual trigger
         }
     });
 
