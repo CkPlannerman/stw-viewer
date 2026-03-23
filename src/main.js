@@ -201,7 +201,6 @@ void main() {
         1.0
     );
 
-    float dist = -camPos.z;
     float nearFade = smoothstep(0.5, 3.0, dist);
 
     v_color = vec4(a_color.rgb, a_color.a * nearFade);
