@@ -91,31 +91,16 @@ void main() {
 
     vec4 camPos = u_view * vec4(a_position, 1.0);
 
-    // Early depth cull — behind camera
-    if (camPos.z > -0.3) {
+    if (camPos.z > -0.5) {
         gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
         v_color = vec4(0.0);
         return;
     }
 
-    // Early distance cull — very far splats contribute nothing
     float dist = -camPos.z;
-    if (dist > 2000.0) {
-        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
-        v_color = vec4(0.0);
-        return;
-    }
 
     vec4 clipPos = u_projection * camPos;
     vec2 ndc = clipPos.xy / clipPos.w;
-
-    // Aggressive frustum cull — skip splats well outside screen
-    if (abs(ndc.x) > 1.3 || abs(ndc.y) > 1.3) {
-        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
-        v_color = vec4(0.0);
-        return;
-    }
-
     float screenDist = length(ndc);
 
     float localMorph = clamp(u_radialProgress - screenDist * 0.7, 0.0, 1.0);
@@ -138,6 +123,11 @@ void main() {
 
     float nx = camPos.x / camPos.z;
     float ny = camPos.y / camPos.z;
+    if (abs(nx) > tanFovX * 1.5 || abs(ny) > tanFovY * 1.5) {
+        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+        v_color = vec4(0.0);
+        return;
+    }
     camPos.x = clamp(nx, -tanFovX, tanFovX) * camPos.z;
     camPos.y = clamp(ny, -tanFovY, tanFovY) * camPos.z;
 
@@ -169,7 +159,7 @@ void main() {
     float r2 = sqrt(lambda2);
 
     float maxRadius = 2.0 * max(r1, r2);
-    maxRadius = min(maxRadius, 64.0);  // tighter cap for performance
+    maxRadius = min(maxRadius, 100.0);
 
     float pointSize = mix(2.0, 0.0, localMorph);
     maxRadius = max(maxRadius, pointSize);
@@ -223,7 +213,7 @@ void main() {
     float sharpness = mix(10.0, 1.2, v_localMorph);
     float gaussian = exp(-0.5 * sharpness * d2);
 
-    if (gaussian < 0.04) discard;  // more aggressive discard for perf
+    if (gaussian < 0.02) discard;
 
     float splatOpacity = mix(1.0, 0.95, v_localMorph);
     float alpha = gaussian * splatOpacity * v_color.a;
