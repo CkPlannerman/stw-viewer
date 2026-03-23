@@ -720,9 +720,9 @@ export class PanoWaypointSystem {
     // Handle panorama look-around controls
     handlePanoInput(dx, dy, scrollDelta) {
         if (!this.active) return;
-        this.panoTheta -= dx * 0.003;
+        this.panoTheta += dx * 0.003;
         this.panoPhi = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01,
-            this.panoPhi + dy * 0.003));
+            this.panoPhi - dy * 0.003));
 
         if (scrollDelta) {
             this.panoFov = Math.max(30, Math.min(110, this.panoFov + scrollDelta * 0.05));
