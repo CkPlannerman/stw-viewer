@@ -572,11 +572,8 @@ class SplatRenderer {
         this.splatScale = 0.6;
         this.dataTexWidth = 4096;
 
-        this.ssaoEnabled = true;
-
         this._initShaders();
         this._initQuadGeometry();
-        this._initSSAO();
         this.sky = new SkyRenderer(this.gl);
     }
 
@@ -625,162 +622,6 @@ class SplatRenderer {
         this.quadEBO = gl.createBuffer();
         gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.quadEBO);
         gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array([0, 1, 2, 2, 1, 3]), gl.STATIC_DRAW);
-    }
-
-    _initSSAO() {
-        const gl = this.gl;
-
-        // Fullscreen quad for post-process
-        this.ssaoQuadVAO = gl.createVertexArray();
-        gl.bindVertexArray(this.ssaoQuadVAO);
-        const buf = gl.createBuffer();
-        gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
-            -1,-1, 1,-1, -1,1, -1,1, 1,-1, 1,1
-        ]), gl.STATIC_DRAW);
-
-        // Composite shader: multiply color by AO
-        const compositeVS = `#version 300 es
-        precision highp float;
-        in vec2 a_pos;
-        out vec2 v_uv;
-        void main() {
-            v_uv = a_pos * 0.5 + 0.5;
-            gl_Position = vec4(a_pos, 0.0, 1.0);
-        }`;
-
-        const compositeFS = `#version 300 es
-        precision highp float;
-        in vec2 v_uv;
-        out vec4 fragColor;
-        uniform sampler2D u_color;
-        uniform sampler2D u_depth;
-        uniform vec2 u_resolution;
-        uniform float u_near;
-        uniform float u_far;
-
-        float linearDepth(float d) {
-            float z = d * 2.0 - 1.0;
-            return (2.0 * u_near * u_far) / (u_far + u_near - z * (u_far - u_near));
-        }
-
-        void main() {
-            vec4 color = texture(u_color, v_uv);
-            float depth = texture(u_depth, v_uv).r;
-
-            // Skip sky (depth = 1.0)
-            if (depth >= 0.9999) {
-                fragColor = color;
-                return;
-            }
-
-            float centerZ = linearDepth(depth);
-            float ao = 0.0;
-            float radius = 3.0; // pixels
-
-            // 8-sample SSAO
-            const int SAMPLES = 8;
-            vec2 offsets[8] = vec2[8](
-                vec2(1.0, 0.0), vec2(-1.0, 0.0),
-                vec2(0.0, 1.0), vec2(0.0, -1.0),
-                vec2(0.7, 0.7), vec2(-0.7, 0.7),
-                vec2(0.7, -0.7), vec2(-0.7, -0.7)
-            );
-
-            for (int i = 0; i < SAMPLES; i++) {
-                vec2 sampleUV = v_uv + offsets[i] * radius / u_resolution;
-                float sampleDepth = texture(u_depth, sampleUV).r;
-                if (sampleDepth >= 0.9999) continue;
-                float sampleZ = linearDepth(sampleDepth);
-                float diff = centerZ - sampleZ;
-                // Occluded if neighbor is closer (in front)
-                ao += smoothstep(0.0, 2.0, diff) * smoothstep(8.0, 0.5, abs(diff));
-            }
-
-            ao = ao / float(SAMPLES);
-            float occlusion = 1.0 - ao * 0.6; // max 60% darkening
-            occlusion = clamp(occlusion, 0.4, 1.0);
-
-            fragColor = vec4(color.rgb * occlusion, color.a);
-        }`;
-
-        const vs = gl.createShader(gl.VERTEX_SHADER);
-        gl.shaderSource(vs, compositeVS);
-        gl.compileShader(vs);
-        if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS))
-            console.error("SSAO VS:", gl.getShaderInfoLog(vs));
-
-        const fs = gl.createShader(gl.FRAGMENT_SHADER);
-        gl.shaderSource(fs, compositeFS);
-        gl.compileShader(fs);
-        if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS))
-            console.error("SSAO FS:", gl.getShaderInfoLog(fs));
-
-        this.ssaoProgram = gl.createProgram();
-        gl.attachShader(this.ssaoProgram, vs);
-        gl.attachShader(this.ssaoProgram, fs);
-
-        const aLoc = 0;
-        gl.bindAttribLocation(this.ssaoProgram, aLoc, "a_pos");
-        gl.linkProgram(this.ssaoProgram);
-        if (!gl.getProgramParameter(this.ssaoProgram, gl.LINK_STATUS))
-            console.error("SSAO link:", gl.getProgramInfoLog(this.ssaoProgram));
-
-        gl.enableVertexAttribArray(aLoc);
-        gl.vertexAttribPointer(aLoc, 2, gl.FLOAT, false, 0, 0);
-        gl.bindVertexArray(null);
-
-        this.ssao_color = gl.getUniformLocation(this.ssaoProgram, "u_color");
-        this.ssao_depth = gl.getUniformLocation(this.ssaoProgram, "u_depth");
-        this.ssao_resolution = gl.getUniformLocation(this.ssaoProgram, "u_resolution");
-        this.ssao_near = gl.getUniformLocation(this.ssaoProgram, "u_near");
-        this.ssao_far = gl.getUniformLocation(this.ssaoProgram, "u_far");
-
-        // FBO will be created/resized in render
-        this.fbo = null;
-        this.fboColor = null;
-        this.fboDepth = null;
-        this.fboWidth = 0;
-        this.fboHeight = 0;
-    }
-
-    _ensureFBO(width, height) {
-        if (this.fboWidth === width && this.fboHeight === height && this.fbo) return;
-
-        const gl = this.gl;
-
-        if (this.fbo) {
-            gl.deleteFramebuffer(this.fbo);
-            gl.deleteTexture(this.fboColor);
-            gl.deleteTexture(this.fboDepth);
-        }
-
-        this.fbo = gl.createFramebuffer();
-        gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo);
-
-        // Color attachment
-        this.fboColor = gl.createTexture();
-        gl.bindTexture(gl.TEXTURE_2D, this.fboColor);
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.fboColor, 0);
-
-        // Depth attachment (texture so we can read it in SSAO)
-        this.fboDepth = gl.createTexture();
-        gl.bindTexture(gl.TEXTURE_2D, this.fboDepth);
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.DEPTH_COMPONENT24, width, height, 0, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, null);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, this.fboDepth, 0);
-
-        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-        this.fboWidth = width;
-        this.fboHeight = height;
     }
 
     _createDataTexture(data, components, count) {
@@ -846,36 +687,23 @@ class SplatRenderer {
 
     render(projMatrix, viewMatrix) {
         const gl = this.gl;
-        const w = this.canvas.width, h = this.canvas.height;
-
-        // Render to FBO if SSAO is enabled
-        if (this.ssaoEnabled && this.splatCount > 0) {
-            this._ensureFBO(w, h);
-            gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo);
-        }
-
-        gl.viewport(0, 0, w, h);
+        gl.viewport(0, 0, this.canvas.width, this.canvas.height);
         gl.clearColor(0.0, 0.0, 0.0, 1.0);
         gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
         this.sky.render(projMatrix, viewMatrix);
 
-        if (this.splatCount === 0) {
-            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-            return;
-        }
+        if (this.splatCount === 0) return;
 
-        // Render splats with depth writing (for SSAO depth buffer)
         gl.enable(gl.BLEND);
         gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-        gl.enable(gl.DEPTH_TEST);
-        gl.depthFunc(gl.ALWAYS); // always write depth (back-to-front sorted)
-        gl.depthMask(true);
+        gl.disable(gl.DEPTH_TEST);
+        gl.depthMask(false);
 
         gl.useProgram(this.program);
         gl.uniformMatrix4fv(this.u_projection, false, projMatrix);
         gl.uniformMatrix4fv(this.u_view, false, viewMatrix);
-        gl.uniform2f(this.u_viewport, w, h);
+        gl.uniform2f(this.u_viewport, this.canvas.width, this.canvas.height);
         gl.uniform1f(this.u_morphProgress, this.morphProgress);
         gl.uniform1f(this.u_splatScale, this.splatScale);
         gl.uniform1f(this.u_radialProgress, this.radialProgress);
@@ -899,36 +727,8 @@ class SplatRenderer {
         gl.bindVertexArray(null);
 
         gl.disable(gl.BLEND);
-        gl.depthFunc(gl.LESS);
+        gl.enable(gl.DEPTH_TEST);
         gl.depthMask(true);
-
-        // SSAO composite pass
-        if (this.ssaoEnabled) {
-            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-            gl.viewport(0, 0, w, h);
-            gl.disable(gl.DEPTH_TEST);
-            gl.disable(gl.BLEND);
-
-            gl.useProgram(this.ssaoProgram);
-
-            gl.activeTexture(gl.TEXTURE0);
-            gl.bindTexture(gl.TEXTURE_2D, this.fboColor);
-            gl.uniform1i(this.ssao_color, 0);
-
-            gl.activeTexture(gl.TEXTURE1);
-            gl.bindTexture(gl.TEXTURE_2D, this.fboDepth);
-            gl.uniform1i(this.ssao_depth, 1);
-
-            gl.uniform2f(this.ssao_resolution, w, h);
-            gl.uniform1f(this.ssao_near, 0.1);
-            gl.uniform1f(this.ssao_far, 10000.0);
-
-            gl.bindVertexArray(this.ssaoQuadVAO);
-            gl.drawArrays(gl.TRIANGLES, 0, 6);
-            gl.bindVertexArray(null);
-
-            gl.enable(gl.DEPTH_TEST);
-        }
     }
 }
 
