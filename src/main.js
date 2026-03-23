@@ -111,7 +111,7 @@ void main() {
     float hoverShrink = 1.0;
     if (u_hoverActive > 0.5) {
         float distToHover = distance(a_position, u_hoverPos);
-        float radius = 15.0; // shrink radius in world units
+        float radius = 60.0; // shrink radius in world units (feet)
         float falloff = smoothstep(0.0, radius, distToHover);
         hoverShrink = mix(0.15, 1.0, falloff); // shrink to 15% at center
     }
@@ -785,14 +785,10 @@ class OrbitCamera {
         this.baseDist = 0;
         this.basePhi = 0;
 
-        // Tour
-        this.tourActive = false;
-        this.tourPresets = [];
-        this.tourIndex = 0;
-        this.tourStartTime = 0;
-        this.tourTransitionDuration = 3000; // ms to move between presets
-        this.tourHoldDuration = 5000;       // ms to hold at each preset
-        this.tourStartState = null;
+        // Idle auto-orbit
+        this.idleTimeout = 20000; // ms before idle orbit starts
+        this.lastInteractionTime = performance.now();
+        this.idleOrbitSpeed = 0.04; // slow idle rotation
 
         this._initControls();
     }
@@ -805,7 +801,7 @@ class OrbitCamera {
         const onUserInteract = () => {
             this.userInteracted = true;
             this.autoOrbit = false;
-            this.tourActive = false;
+            this.lastInteractionTime = performance.now();
         };
 
         // Mouse controls
@@ -924,98 +920,16 @@ class OrbitCamera {
         });
     }
 
-    // Camera preset tour
-    setPresets(bbox) {
-        const cx = (bbox.min[0] + bbox.max[0]) / 2;
-        const cy = (bbox.min[1] + bbox.max[1]) / 2;
-        const cz = (bbox.min[2] + bbox.max[2]) / 2;
-        const dx = bbox.max[0] - bbox.min[0];
-        const dz = bbox.max[2] - bbox.min[2];
-        const maxExtent = Math.max(dx, bbox.max[1] - bbox.min[1], dz);
-
-        this.tourPresets = [
-            { // Aerial overview
-                theta: Math.PI / 4, phi: 1.0,
-                distance: maxExtent * 0.8,
-                target: [cx, cy, cz],
-                label: "Aerial Overview"
-            },
-            { // Street level - side A
-                theta: 0, phi: 0.15,
-                distance: maxExtent * 0.3,
-                target: [cx, cy, cz],
-                label: "Street Level"
-            },
-            { // Elevated perspective
-                theta: Math.PI * 0.75, phi: 0.5,
-                distance: maxExtent * 0.5,
-                target: [cx, cy, cz],
-                label: "Elevated View"
-            },
-            { // Close-up detail
-                theta: Math.PI * 1.5, phi: 0.25,
-                distance: maxExtent * 0.2,
-                target: [cx + dx * 0.2, cy, cz + dz * 0.1],
-                label: "Detail View"
-            },
-        ];
-    }
-
-    startTour() {
-        if (this.tourPresets.length === 0) return;
-        this.tourActive = true;
-        this.autoOrbit = false;
-        this.userInteracted = false;
-        this.tourIndex = 0;
-        this.tourStartTime = performance.now();
-        this.tourStartState = {
-            theta: this.theta,
-            phi: this.phi,
-            distance: this.distance,
-            target: [...this.target],
-        };
-    }
+    setPresets() {} // removed — kept for compat
 
     update(dt) {
-        // Tour mode
-        if (this.tourActive) {
-            const elapsed = performance.now() - this.tourStartTime;
-            const cycleDuration = this.tourTransitionDuration + this.tourHoldDuration;
-            const cycleTime = elapsed % cycleDuration;
-
-            if (cycleTime < this.tourTransitionDuration) {
-                // Transitioning
-                let t = cycleTime / this.tourTransitionDuration;
-                t = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2; // ease in-out
-
-                const preset = this.tourPresets[this.tourIndex];
-                const start = this.tourStartState;
-
-                this.theta = start.theta + (preset.theta - start.theta) * t;
-                this.phi = start.phi + (preset.phi - start.phi) * t;
-                this.distance = start.distance + (preset.distance - start.distance) * t;
-                this.target[0] = start.target[0] + (preset.target[0] - start.target[0]) * t;
-                this.target[1] = start.target[1] + (preset.target[1] - start.target[1]) * t;
-                this.target[2] = start.target[2] + (preset.target[2] - start.target[2]) * t;
-            } else {
-                // Holding — gentle orbit
-                this.theta += 0.03 * dt;
+        // Idle auto-orbit: start slowly rotating after 20s of no interaction
+        if (this.userInteracted && !this.swoopActive) {
+            const idleTime = performance.now() - this.lastInteractionTime;
+            if (idleTime > this.idleTimeout) {
+                this.theta += this.idleOrbitSpeed * dt;
+                this._dirty = true;
             }
-
-            // Check if cycle complete, advance to next preset
-            if (elapsed > cycleDuration) {
-                this.tourStartState = {
-                    theta: this.theta,
-                    phi: this.phi,
-                    distance: this.distance,
-                    target: [...this.target],
-                };
-                this.tourIndex = (this.tourIndex + 1) % this.tourPresets.length;
-                this.tourStartTime = performance.now();
-            }
-
-            this._dirty = true;
-            return;
         }
 
         // Swoop animation
@@ -1273,7 +1187,6 @@ async function init() {
     const morphLabel = document.getElementById("morph-label");
     const infoEl = document.getElementById("info");
     const dropZone = document.getElementById("drop-zone");
-    const tourBtn = document.getElementById("tour-btn");
     const fsBtn = document.getElementById("fs-btn");
 
     const renderScale = 0.85;
@@ -1369,19 +1282,6 @@ async function init() {
         intro.active = false;
         intro.radialProgress = (morphSlider.value / 100) * 2.2;
     });
-
-    // Tour button
-    if (tourBtn) {
-        tourBtn.addEventListener("click", () => {
-            if (camera.tourActive) {
-                camera.tourActive = false;
-                tourBtn.textContent = "Tour";
-            } else {
-                camera.startTour();
-                tourBtn.textContent = "Stop";
-            }
-        });
-    }
 
     // Waypoint click handler
     canvas.addEventListener("click", async (e) => {
