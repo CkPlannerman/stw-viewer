@@ -108,13 +108,11 @@ void main() {
     localMorph = localMorph * localMorph * (3.0 - 2.0 * localMorph);
 
     // Local hover shrink: splats near the hovered waypoint get smaller
-    float hoverShrink = 1.0;
-    if (u_hoverActive > 0.5) {
-        float distToHover = distance(a_position, u_hoverPos);
-        float radius = 60.0; // shrink radius in world units (feet)
-        float falloff = smoothstep(0.0, radius, distToHover);
-        hoverShrink = mix(0.15, 1.0, falloff); // shrink to 15% at center
-    }
+    float distToHover = distance(a_position, u_hoverPos);
+    float radius = 60.0; // shrink radius in world units (feet)
+    float falloff = smoothstep(0.0, radius, distToHover);
+    float hoverShrink = mix(0.1, 1.0, falloff); // 10% at center, 100% at edge
+    hoverShrink = mix(1.0, hoverShrink, u_hoverActive); // blend with hover intensity
 
     float minScale = 0.001;
     vec3 morphedScale = mix(vec3(minScale), a_scale * u_splatScale * hoverShrink, localMorph);
@@ -1434,7 +1432,7 @@ async function init() {
         // Set localized hover shrink around hovered waypoint
         const hovered = panoSystem.hoveredWaypoint;
         const targetHover = hovered ? 1.0 : 0.0;
-        renderer.hoverActive += (targetHover - renderer.hoverActive) * 0.12; // smooth transition
+        renderer.hoverActive += (targetHover - renderer.hoverActive) * 0.25; // responsive transition
         if (hovered) {
             // Smoothly move hover position
             renderer.hoverPos[0] += (hovered.pos[0] - renderer.hoverPos[0]) * 0.15;
