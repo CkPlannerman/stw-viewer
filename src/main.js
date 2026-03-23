@@ -1,15 +1,23 @@
 /**
- * Gaussian Splat Viewer with Point Cloud Morph Animation
+ * Gaussian Splat Viewer — Optimized for Proposal Presentations
  *
- * Features:
- * - Swoop-in camera animation on load
- * - Auto-orbit until user interacts
- * - Radial morph from center outward (points -> splats)
- * - Sky gradient background
- * - WebGL2 Gaussian splat rendering
+ * Performance optimizations:
+ * - Sort worker keeps positions in memory (no 240MB copy per sort)
+ * - Sort throttled to max every 200ms
+ * - Render at adaptive resolution
+ * - Efficient texture-based GPU rendering
  *
- * Based on the rendering approach from antimatter15/splat (MIT license).
+ * Presentation features:
+ * - Camera preset tour with smooth transitions
+ * - Touch controls (pinch-zoom, two-finger pan)
+ * - Fullscreen mode
+ * - Cinematic auto-orbit with zoom/elevation oscillation
+ * - Radial morph animation (points → splats)
+ * - HDR cubemap sky background
+ * - 360 panorama waypoints (click to enter immersive pano)
  */
+
+import { PanoWaypointSystem } from "./pano-viewer.js";
 
 // ============================================================
 // Shader sources
@@ -34,14 +42,10 @@ uniform mat4 u_invViewProj;
 uniform samplerCube u_envCube;
 
 void main() {
-    // Reconstruct world-space ray direction from NDC
     vec4 nearPoint = u_invViewProj * vec4(v_ndc, -1.0, 1.0);
     vec4 farPoint  = u_invViewProj * vec4(v_ndc,  1.0, 1.0);
     vec3 rayDir = normalize(farPoint.xyz / farPoint.w - nearPoint.xyz / nearPoint.w);
-
-    // Cubemap sampling - zero seam artifacts
     vec3 color = texture(u_envCube, rayDir).rgb;
-
     fragColor = vec4(color, 1.0);
 }
 `;
@@ -51,26 +55,22 @@ precision highp float;
 
 uniform mat4 u_projection;
 uniform mat4 u_view;
-uniform vec2 u_viewport;       // (width, height)
-uniform float u_morphProgress; // 0 = points, 1 = full splats
-uniform float u_splatScale;    // global scale multiplier
-uniform float u_radialProgress; // for radial reveal (0-2 range, >1 = fully revealed)
+uniform vec2 u_viewport;
+uniform float u_morphProgress;
+uniform float u_splatScale;
+uniform float u_radialProgress;
 
-// Data textures (original unsorted data, uploaded once)
-uniform sampler2D u_posTex;    // RGBA32F: x, y, z, 0
-uniform sampler2D u_scaleTex;  // RGBA32F: sx, sy, sz, 0
-uniform sampler2D u_colorTex;  // RGBA32F: r, g, b, a
-uniform sampler2D u_rotTex;    // RGBA32F: w, x, y, z
-uniform int u_texWidth;        // data texture width
+uniform sampler2D u_posTex;
+uniform sampler2D u_scaleTex;
+uniform sampler2D u_colorTex;
+uniform sampler2D u_rotTex;
+uniform int u_texWidth;
 
-// Per-splat: sort index (only this is re-uploaded per sort)
 in uint a_sortIndex;
-
-// Per-vertex (quad corner)
-in vec2 a_quadOffset; // (-1,-1), (1,-1), (-1,1), (1,1)
+in vec2 a_quadOffset;
 
 out vec4 v_color;
-out vec2 v_offset;    // quad position for Gaussian falloff
+out vec2 v_offset;
 out float v_localMorph;
 
 mat3 quatToMat3(vec4 q) {
@@ -83,7 +83,6 @@ mat3 quatToMat3(vec4 q) {
 }
 
 void main() {
-    // Fetch splat data from textures using sort index
     int idx = int(a_sortIndex);
     ivec2 texCoord = ivec2(idx % u_texWidth, idx / u_texWidth);
     vec3 a_position = texelFetch(u_posTex, texCoord, 0).xyz;
@@ -91,7 +90,6 @@ void main() {
     vec4 a_color = texelFetch(u_colorTex, texCoord, 0);
     vec4 a_rotation = texelFetch(u_rotTex, texCoord, 0);
 
-    // Project to camera space first to get screen position for radial morph
     vec4 camPos = u_view * vec4(a_position, 1.0);
 
     if (camPos.z > -0.5) {
@@ -100,23 +98,16 @@ void main() {
         return;
     }
 
-    // Compute preliminary screen position for radial distance
     vec4 clipPos = u_projection * camPos;
     vec2 ndc = clipPos.xy / clipPos.w;
-    float screenDist = length(ndc); // 0 at center, ~1.4 at corners
+    float screenDist = length(ndc);
 
-    // Radial morph: center reveals first, edges last
-    // u_radialProgress goes 0->2, screenDist is 0->~1.4
-    // Each splat's local morph = clamp(radialProgress - screenDist * 0.8, 0, 1)
     float localMorph = clamp(u_radialProgress - screenDist * 0.7, 0.0, 1.0);
-    // Smooth ease
     localMorph = localMorph * localMorph * (3.0 - 2.0 * localMorph);
 
-    // Morph: interpolate scale from tiny point to full splat
     float minScale = 0.001;
     vec3 morphedScale = mix(vec3(minScale), a_scale * u_splatScale, localMorph);
 
-    // Compute 3D covariance from scale + rotation
     mat3 R = quatToMat3(a_rotation);
     mat3 S = mat3(
         morphedScale.x, 0.0, 0.0,
@@ -126,22 +117,18 @@ void main() {
     mat3 M = R * S;
     mat3 Sigma = M * transpose(M);
 
-    // Jacobian of perspective projection
     float tanFovY = 1.0 / u_projection[1][1];
     float tanFovX = tanFovY * u_viewport.x / u_viewport.y;
-    float limx = 1.0 * tanFovX;
-    float limy = 1.0 * tanFovY;
 
-    // Clamp to frustum edges
     float nx = camPos.x / camPos.z;
     float ny = camPos.y / camPos.z;
-    if (abs(nx) > limx * 1.5 || abs(ny) > limy * 1.5) {
+    if (abs(nx) > tanFovX * 1.5 || abs(ny) > tanFovY * 1.5) {
         gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
         v_color = vec4(0.0);
         return;
     }
-    camPos.x = clamp(nx, -limx, limx) * camPos.z;
-    camPos.y = clamp(ny, -limy, limy) * camPos.z;
+    camPos.x = clamp(nx, -tanFovX, tanFovX) * camPos.z;
+    camPos.y = clamp(ny, -tanFovY, tanFovY) * camPos.z;
 
     float focal_y = u_viewport.y / (2.0 * tanFovY);
     float focal_x = u_viewport.x / (2.0 * tanFovX);
@@ -152,17 +139,14 @@ void main() {
         0.0, 0.0, 0.0
     );
 
-    // 3D covariance in camera space
     mat3 viewRot = mat3(u_view);
     mat3 T = J * viewRot;
     mat3 cov2d = T * Sigma * transpose(T);
 
-    // Extract 2D covariance (upper-left 2x2)
     float a = cov2d[0][0] + 0.3;
     float b = cov2d[0][1];
     float c = cov2d[1][1] + 0.3;
 
-    // Eigenvalues
     float det = a * c - b * b;
     float trace = a + c;
     float disc = max(0.01, trace * trace / 4.0 - det);
@@ -176,11 +160,9 @@ void main() {
     float maxRadius = 2.0 * max(r1, r2);
     maxRadius = min(maxRadius, 100.0);
 
-    // Point-like minimum size when not morphed
     float pointSize = mix(2.0, 0.0, localMorph);
     maxRadius = max(maxRadius, pointSize);
 
-    // Eigenvector direction
     vec2 v1;
     if (abs(b) > 0.0001) {
         v1 = normalize(vec2(lambda1 - c, b));
@@ -189,7 +171,6 @@ void main() {
     }
     vec2 v2 = vec2(-v1.y, v1.x);
 
-    // Skip splats that project to < 0.5px (sub-pixel, invisible)
     float maxScreenR = max(r1, r2) * 2.0 / max(u_viewport.x, u_viewport.y) * 2.0;
     if (maxScreenR < 0.001) {
         gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
@@ -209,7 +190,6 @@ void main() {
         1.0
     );
 
-    // Distance-based fade
     float dist = -camPos.z;
     float nearFade = smoothstep(0.5, 3.0, dist);
 
@@ -230,14 +210,11 @@ out vec4 fragColor;
 
 void main() {
     float d2 = dot(v_offset, v_offset);
-
-    // Sharper at low morph (point-like), softer at full morph (Gaussian)
     float sharpness = mix(10.0, 1.2, v_localMorph);
     float gaussian = exp(-0.5 * sharpness * d2);
 
     if (gaussian < 0.02) discard;
 
-    // High opacity so stacked splats create opaque surfaces
     float splatOpacity = mix(1.0, 0.95, v_localMorph);
     float alpha = gaussian * splatOpacity * v_color.a;
 
@@ -247,7 +224,7 @@ void main() {
 
 
 // ============================================================
-// Splat file loader
+// Splat file loader (supports single file and chunked)
 // ============================================================
 
 async function fetchWithProgress(url, loadingBar, loadingText, label, offsetBytes, totalBytes) {
@@ -290,7 +267,6 @@ async function loadSplatFile(urlOrFile) {
         return parseSplatBuffer(buffer);
     }
 
-    // Try loading as single file first
     loadingText.textContent = "Loading splat data...";
     try {
         const headResp = await fetch(urlOrFile, { method: "HEAD" });
@@ -299,16 +275,10 @@ async function loadSplatFile(urlOrFile) {
                 "Loading splat data...", 0, +headResp.headers.get("Content-Length") || 0);
             return parseSplatBuffer(data.buffer);
         }
-    } catch (e) {
-        // Single file failed, try chunked loading below
-    }
+    } catch (e) { /* fall through to chunked */ }
 
-    // Try chunked loading: url.000, url.001, ...
+    // Chunked loading: url.000, url.001, ...
     loadingText.textContent = "Loading splat chunks...";
-    const chunkBuffers = [];
-    let totalSize = 0;
-
-    // First, probe how many chunks exist by HEAD requests
     const chunkSizes = [];
     for (let i = 0; i < 100; i++) {
         const chunkUrl = `${urlOrFile}.${String(i).padStart(3, '0')}`;
@@ -324,6 +294,7 @@ async function loadSplatFile(urlOrFile) {
     }
 
     const grandTotal = chunkSizes.reduce((s, c) => s + c.size, 0);
+    const chunkBuffers = [];
     let loaded = 0;
 
     for (let i = 0; i < chunkSizes.length; i++) {
@@ -334,7 +305,6 @@ async function loadSplatFile(urlOrFile) {
         loaded += data.length;
     }
 
-    // Concatenate all chunks
     const combined = new Uint8Array(loaded);
     let offset = 0;
     for (const buf of chunkBuffers) {
@@ -343,10 +313,6 @@ async function loadSplatFile(urlOrFile) {
     }
 
     return parseSplatBuffer(combined.buffer);
-}
-
-async function loadSplatChunked(baseName) {
-    return loadSplatFile(baseName);
 }
 
 
@@ -392,18 +358,16 @@ function parseSplatBuffer(buffer) {
 
 
 // ============================================================
-// Sorting (back-to-front by depth)
+// Sorting (inline fallback, worker is preferred)
 // ============================================================
 
 function sortSplats(splatData, viewMatrix) {
     const { count, positions } = splatData;
     const depths = new Float32Array(count);
-    const indices = new Uint32Array(count);
 
     const vx = viewMatrix[2], vy = viewMatrix[6], vz = viewMatrix[10], vw = viewMatrix[14];
     for (let i = 0; i < count; i++) {
         depths[i] = vx * positions[i * 3] + vy * positions[i * 3 + 1] + vz * positions[i * 3 + 2] + vw;
-        indices[i] = i;
     }
 
     const maxDepth = Math.max(...depths.slice(0, Math.min(1000, count)).map(Math.abs)) * 2;
@@ -414,14 +378,16 @@ function sortSplats(splatData, viewMatrix) {
         keys[i] = Math.max(0, Math.min(65535, ~~((maxDepth + depths[i]) * depthInv)));
     }
 
+    const indices = new Uint32Array(count);
+    for (let i = 0; i < count; i++) indices[i] = i;
+
     const counts0 = new Uint32Array(256);
     for (let i = 0; i < count; i++) counts0[keys[i] & 0xFF]++;
     const offsets0 = new Uint32Array(256);
     for (let i = 1; i < 256; i++) offsets0[i] = offsets0[i - 1] + counts0[i - 1];
     const temp = new Uint32Array(count);
     for (let i = 0; i < count; i++) {
-        const k = keys[indices[i]] & 0xFF;
-        temp[offsets0[k]++] = indices[i];
+        temp[offsets0[keys[indices[i]] & 0xFF]++] = indices[i];
     }
 
     const counts1 = new Uint32Array(256);
@@ -430,52 +396,15 @@ function sortSplats(splatData, viewMatrix) {
     for (let i = 1; i < 256; i++) offsets1[i] = offsets1[i - 1] + counts1[i - 1];
     const sorted = new Uint32Array(count);
     for (let i = 0; i < count; i++) {
-        const k = (keys[temp[i]] >> 8) & 0xFF;
-        sorted[offsets1[k]++] = temp[i];
+        sorted[offsets1[(keys[temp[i]] >> 8) & 0xFF]++] = temp[i];
     }
 
     return sorted;
 }
 
 
-function reorderSplatData(splatData, sortedIndices) {
-    const { count, positions, scales, colors, rotations } = splatData;
-
-    const newPositions = new Float32Array(count * 3);
-    const newScales = new Float32Array(count * 3);
-    const newColors = new Float32Array(count * 4);
-    const newRotations = new Float32Array(count * 4);
-
-    for (let i = 0; i < count; i++) {
-        const src = sortedIndices[i];
-        newPositions[i * 3 + 0] = positions[src * 3 + 0];
-        newPositions[i * 3 + 1] = positions[src * 3 + 1];
-        newPositions[i * 3 + 2] = positions[src * 3 + 2];
-        newScales[i * 3 + 0] = scales[src * 3 + 0];
-        newScales[i * 3 + 1] = scales[src * 3 + 1];
-        newScales[i * 3 + 2] = scales[src * 3 + 2];
-        newColors[i * 4 + 0] = colors[src * 4 + 0];
-        newColors[i * 4 + 1] = colors[src * 4 + 1];
-        newColors[i * 4 + 2] = colors[src * 4 + 2];
-        newColors[i * 4 + 3] = colors[src * 4 + 3];
-        newRotations[i * 4 + 0] = rotations[src * 4 + 0];
-        newRotations[i * 4 + 1] = rotations[src * 4 + 1];
-        newRotations[i * 4 + 2] = rotations[src * 4 + 2];
-        newRotations[i * 4 + 3] = rotations[src * 4 + 3];
-    }
-
-    return {
-        count,
-        positions: newPositions,
-        scales: newScales,
-        colors: newColors,
-        rotations: newRotations,
-    };
-}
-
-
 // ============================================================
-// Sky renderer (fullscreen gradient quad)
+// Sky renderer (cubemap from equirectangular)
 // ============================================================
 
 class SkyRenderer {
@@ -486,59 +415,41 @@ class SkyRenderer {
         const vs = gl.createShader(gl.VERTEX_SHADER);
         gl.shaderSource(vs, SKY_VERT);
         gl.compileShader(vs);
-        if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) {
-            console.error("Sky VS error:", gl.getShaderInfoLog(vs));
-        }
 
         const fs = gl.createShader(gl.FRAGMENT_SHADER);
         gl.shaderSource(fs, SKY_FRAG);
         gl.compileShader(fs);
-        if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) {
-            console.error("Sky FS error:", gl.getShaderInfoLog(fs));
-        }
 
         this.program = gl.createProgram();
         gl.attachShader(this.program, vs);
         gl.attachShader(this.program, fs);
         gl.linkProgram(this.program);
-        if (!gl.getProgramParameter(this.program, gl.LINK_STATUS)) {
-            console.error("Sky program link error:", gl.getProgramInfoLog(this.program));
-        }
 
         this.u_invViewProj = gl.getUniformLocation(this.program, "u_invViewProj");
         this.u_envCube = gl.getUniformLocation(this.program, "u_envCube");
 
-        // Fullscreen quad
         this.vao = gl.createVertexArray();
         gl.bindVertexArray(this.vao);
-
         const buf = gl.createBuffer();
         gl.bindBuffer(gl.ARRAY_BUFFER, buf);
         gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
-            -1, -1,  1, -1,  -1, 1,
-            -1,  1,  1, -1,   1, 1,
+            -1, -1,  1, -1,  -1, 1,  -1,  1,  1, -1,   1, 1,
         ]), gl.STATIC_DRAW);
-
         const loc = gl.getAttribLocation(this.program, "a_pos");
         gl.enableVertexAttribArray(loc);
         gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-
         gl.bindVertexArray(null);
 
-        // Load equirectangular image and convert to cubemap
         const img = new Image();
         img.onload = () => {
             this.cubemap = this._equirectToCubemap(img, 1024);
             this.ready = true;
-            console.log("Sky cubemap generated from equirectangular");
         };
         img.src = "assets/sky_env.jpg";
     }
 
     _equirectToCubemap(img, faceSize) {
         const gl = this.gl;
-
-        // Read source pixels from equirectangular image
         const tmpCanvas = document.createElement("canvas");
         tmpCanvas.width = img.width;
         tmpCanvas.height = img.height;
@@ -547,18 +458,16 @@ class SkyRenderer {
         const srcData = ctx.getImageData(0, 0, img.width, img.height).data;
         const srcW = img.width, srcH = img.height;
 
-        // Create cubemap texture
         const cubemap = gl.createTexture();
         gl.bindTexture(gl.TEXTURE_CUBE_MAP, cubemap);
 
-        // Face directions: +X, -X, +Y, -Y, +Z, -Z
         const faces = [
-            (u, v) => [ 1, -v, -u],  // +X
-            (u, v) => [-1, -v,  u],  // -X
-            (u, v) => [ u,  1,  v],  // +Y
-            (u, v) => [ u, -1, -v],  // -Y
-            (u, v) => [ u, -v,  1],  // +Z
-            (u, v) => [-u, -v, -1],  // -Z
+            (u, v) => [ 1, -v, -u],
+            (u, v) => [-1, -v,  u],
+            (u, v) => [ u,  1,  v],
+            (u, v) => [ u, -1, -v],
+            (u, v) => [ u, -v,  1],
+            (u, v) => [-u, -v, -1],
         ];
 
         for (let face = 0; face < 6; face++) {
@@ -570,18 +479,13 @@ class SkyRenderer {
                     const u = 2 * (x + 0.5) / faceSize - 1;
                     const v = 2 * (y + 0.5) / faceSize - 1;
                     const dir = dirFn(u, v);
-
-                    // Normalize
                     const len = Math.sqrt(dir[0]*dir[0] + dir[1]*dir[1] + dir[2]*dir[2]);
                     const dx = dir[0]/len, dy = dir[1]/len, dz = dir[2]/len;
-
-                    // Equirectangular UV
                     const phi = Math.atan2(dz, dx);
                     const theta = Math.asin(Math.max(-1, Math.min(1, dy)));
                     let eu = phi / (2 * Math.PI) + 0.5;
                     let ev = 0.5 - theta / Math.PI;
 
-                    // Bilinear sample from source
                     const sx = eu * srcW;
                     const sy = ev * srcH;
                     const sx0 = Math.floor(sx), sy0 = Math.floor(sy);
@@ -618,31 +522,23 @@ class SkyRenderer {
         gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
         gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
 
-        console.log(`Cubemap generated: ${faceSize}x${faceSize} per face`);
         return cubemap;
     }
 
     render(projMatrix, viewMatrix) {
         if (!this.ready) return;
-
         const gl = this.gl;
         gl.disable(gl.BLEND);
         gl.disable(gl.DEPTH_TEST);
         gl.depthMask(false);
 
-        // Remove translation from view for sky (rotation only)
         const skyView = new Float32Array(viewMatrix);
-        skyView[12] = 0;
-        skyView[13] = 0;
-        skyView[14] = 0;
-
-        // mat4Multiply(a, b) computes b*a, so to get P*V we pass (V, P)
+        skyView[12] = 0; skyView[13] = 0; skyView[14] = 0;
         const vp = mat4Multiply(skyView, projMatrix);
         const invVP = mat4Invert(vp);
 
         gl.useProgram(this.program);
         gl.uniformMatrix4fv(this.u_invViewProj, false, invVP);
-
         gl.activeTexture(gl.TEXTURE0);
         gl.bindTexture(gl.TEXTURE_CUBE_MAP, this.cubemap);
         gl.uniform1i(this.u_envCube, 0);
@@ -668,14 +564,13 @@ class SplatRenderer {
         });
         if (!this.gl) throw new Error("WebGL2 not supported");
 
-        // Required for RGBA32F textures
         this.gl.getExtension("EXT_color_buffer_float");
         this.gl.getExtension("OES_texture_float_linear");
 
         this.splatCount = 0;
         this.morphProgress = 0;
         this.radialProgress = 0;
-        this.splatScale = 0.45;
+        this.splatScale = 0.6;
         this.dataTexWidth = 4096;
 
         this._initShaders();
@@ -685,28 +580,24 @@ class SplatRenderer {
 
     _initShaders() {
         const gl = this.gl;
-
         const vs = gl.createShader(gl.VERTEX_SHADER);
         gl.shaderSource(vs, VERT_SRC);
         gl.compileShader(vs);
-        if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) {
+        if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS))
             throw new Error("Vertex shader error: " + gl.getShaderInfoLog(vs));
-        }
 
         const fs = gl.createShader(gl.FRAGMENT_SHADER);
         gl.shaderSource(fs, FRAG_SRC);
         gl.compileShader(fs);
-        if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) {
+        if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS))
             throw new Error("Fragment shader error: " + gl.getShaderInfoLog(fs));
-        }
 
         this.program = gl.createProgram();
         gl.attachShader(this.program, vs);
         gl.attachShader(this.program, fs);
         gl.linkProgram(this.program);
-        if (!gl.getProgramParameter(this.program, gl.LINK_STATUS)) {
+        if (!gl.getProgramParameter(this.program, gl.LINK_STATUS))
             throw new Error("Program link error: " + gl.getProgramInfoLog(this.program));
-        }
 
         this.u_projection = gl.getUniformLocation(this.program, "u_projection");
         this.u_view = gl.getUniformLocation(this.program, "u_view");
@@ -719,31 +610,25 @@ class SplatRenderer {
         this.u_colorTex = gl.getUniformLocation(this.program, "u_colorTex");
         this.u_rotTex = gl.getUniformLocation(this.program, "u_rotTex");
         this.u_texWidth = gl.getUniformLocation(this.program, "u_texWidth");
-
         this.a_sortIndex = gl.getAttribLocation(this.program, "a_sortIndex");
         this.a_quadOffset = gl.getAttribLocation(this.program, "a_quadOffset");
     }
 
     _initQuadGeometry() {
         const gl = this.gl;
-        const quadVerts = new Float32Array([-1,-1, 1,-1, -1,1, 1,1]);
-        const quadIndices = new Uint16Array([0, 1, 2, 2, 1, 3]);
-
         this.quadVBO = gl.createBuffer();
         gl.bindBuffer(gl.ARRAY_BUFFER, this.quadVBO);
-        gl.bufferData(gl.ARRAY_BUFFER, quadVerts, gl.STATIC_DRAW);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
 
         this.quadEBO = gl.createBuffer();
         gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.quadEBO);
-        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, quadIndices, gl.STATIC_DRAW);
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array([0, 1, 2, 2, 1, 3]), gl.STATIC_DRAW);
     }
 
     _createDataTexture(data, components, count) {
         const gl = this.gl;
         const texWidth = 4096;
         const texHeight = Math.ceil(count / texWidth);
-
-        // Pad data to fill full texture
         const padded = new Float32Array(texWidth * texHeight * 4);
         for (let i = 0; i < count; i++) {
             const srcOff = i * components;
@@ -752,7 +637,6 @@ class SplatRenderer {
                 padded[dstOff + c] = data[srcOff + c];
             }
         }
-
         const tex = gl.createTexture();
         gl.bindTexture(gl.TEXTURE_2D, tex);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, texWidth, texHeight, 0, gl.RGBA, gl.FLOAT, padded);
@@ -760,7 +644,6 @@ class SplatRenderer {
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-
         return tex;
     }
 
@@ -769,23 +652,19 @@ class SplatRenderer {
         this.splatCount = splatData.count;
         this.dataTexWidth = 4096;
 
-        // Create data textures (uploaded ONCE, never re-uploaded)
         this.posTex = this._createDataTexture(splatData.positions, 3, splatData.count);
         this.scaleTex = this._createDataTexture(splatData.scales, 3, splatData.count);
         this.colorTex = this._createDataTexture(splatData.colors, 4, splatData.count);
         this.rotTex = this._createDataTexture(splatData.rotations, 4, splatData.count);
 
-        // Create VAO with quad geometry + sort index buffer
         if (this.vao) gl.deleteVertexArray(this.vao);
         this.vao = gl.createVertexArray();
         gl.bindVertexArray(this.vao);
 
-        // Quad corners
         gl.bindBuffer(gl.ARRAY_BUFFER, this.quadVBO);
         gl.enableVertexAttribArray(this.a_quadOffset);
         gl.vertexAttribPointer(this.a_quadOffset, 2, gl.FLOAT, false, 0, 0);
 
-        // Sort index buffer (per-instance, re-uploaded each sort)
         this.sortIndexBuffer = gl.createBuffer();
         const identityIndices = new Uint32Array(splatData.count);
         for (let i = 0; i < splatData.count; i++) identityIndices[i] = i;
@@ -798,29 +677,25 @@ class SplatRenderer {
         gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.quadEBO);
         gl.bindVertexArray(null);
 
-        console.log(`Uploaded ${splatData.count.toLocaleString()} splats to GPU (texture-based)`);
+        console.log(`Uploaded ${splatData.count.toLocaleString()} splats to GPU`);
     }
 
     updateSortOrder(sortedIndices) {
-        // Only upload the sort index buffer (~80MB instead of ~1.1GB)
         const gl = this.gl;
         gl.bindBuffer(gl.ARRAY_BUFFER, this.sortIndexBuffer);
         gl.bufferSubData(gl.ARRAY_BUFFER, 0, sortedIndices);
     }
 
-    render(projMatrix, viewMatrix, time) {
+    render(projMatrix, viewMatrix) {
         const gl = this.gl;
-
         gl.viewport(0, 0, this.canvas.width, this.canvas.height);
         gl.clearColor(0.0, 0.0, 0.0, 1.0);
         gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
-        // Draw sky background first
         this.sky.render(projMatrix, viewMatrix);
 
         if (this.splatCount === 0) return;
 
-        // Splats with blending
         gl.enable(gl.BLEND);
         gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
         gl.disable(gl.DEPTH_TEST);
@@ -835,19 +710,15 @@ class SplatRenderer {
         gl.uniform1f(this.u_radialProgress, this.radialProgress);
         gl.uniform1i(this.u_texWidth, this.dataTexWidth);
 
-        // Bind data textures
         gl.activeTexture(gl.TEXTURE1);
         gl.bindTexture(gl.TEXTURE_2D, this.posTex);
         gl.uniform1i(this.u_posTex, 1);
-
         gl.activeTexture(gl.TEXTURE2);
         gl.bindTexture(gl.TEXTURE_2D, this.scaleTex);
         gl.uniform1i(this.u_scaleTex, 2);
-
         gl.activeTexture(gl.TEXTURE3);
         gl.bindTexture(gl.TEXTURE_2D, this.colorTex);
         gl.uniform1i(this.u_colorTex, 3);
-
         gl.activeTexture(gl.TEXTURE4);
         gl.bindTexture(gl.TEXTURE_2D, this.rotTex);
         gl.uniform1i(this.u_rotTex, 4);
@@ -864,7 +735,7 @@ class SplatRenderer {
 
 
 // ============================================================
-// Orbit camera with auto-orbit and swoop
+// Orbit camera with auto-orbit, swoop, tour, and touch
 // ============================================================
 
 class OrbitCamera {
@@ -879,23 +750,32 @@ class OrbitCamera {
         this.far = 10000;
 
         this._dirty = true;
-        this.autoOrbit = true;          // auto-orbit until user interacts
-        this.autoOrbitSpeed = 0.08;     // radians per second (faster orbit)
+        this.autoOrbit = true;
+        this.autoOrbitSpeed = 0.08;
         this.userInteracted = false;
 
-        // Swoop animation state
+        // Swoop
         this.swoopActive = false;
         this.swoopStartDist = 0;
         this.swoopEndDist = 0;
         this.swoopStartPhi = 0;
         this.swoopEndPhi = 0;
         this.swoopStartTime = 0;
-        this.swoopDuration = 3000; // ms
+        this.swoopDuration = 3000;
 
-        // Cinematic oscillation (continuous after swoop)
+        // Cinematic
         this.cinematicTime = 0;
-        this.baseDist = 0;          // set after fitToScene
-        this.basePhi = 0;           // set after swoop ends
+        this.baseDist = 0;
+        this.basePhi = 0;
+
+        // Tour
+        this.tourActive = false;
+        this.tourPresets = [];
+        this.tourIndex = 0;
+        this.tourStartTime = 0;
+        this.tourTransitionDuration = 3000; // ms to move between presets
+        this.tourHoldDuration = 5000;       // ms to hold at each preset
+        this.tourStartState = null;
 
         this._initControls();
     }
@@ -908,8 +788,10 @@ class OrbitCamera {
         const onUserInteract = () => {
             this.userInteracted = true;
             this.autoOrbit = false;
+            this.tourActive = false;
         };
 
+        // Mouse controls
         this.canvas.addEventListener("mousedown", (e) => {
             onUserInteract();
             if (e.button === 0) dragging = true;
@@ -918,10 +800,7 @@ class OrbitCamera {
             lastY = e.clientY;
         });
 
-        window.addEventListener("mouseup", () => {
-            dragging = false;
-            panning = false;
-        });
+        window.addEventListener("mouseup", () => { dragging = false; panning = false; });
 
         window.addEventListener("mousemove", (e) => {
             const dx = e.clientX - lastX;
@@ -955,21 +834,181 @@ class OrbitCamera {
         }, { passive: false });
 
         this.canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+
+        // Touch controls
+        let touches = [];
+        let lastTouchDist = 0;
+        let lastTouchMidX = 0, lastTouchMidY = 0;
+
+        this.canvas.addEventListener("touchstart", (e) => {
+            e.preventDefault();
+            onUserInteract();
+            touches = Array.from(e.touches);
+            if (touches.length === 2) {
+                const dx = touches[1].clientX - touches[0].clientX;
+                const dy = touches[1].clientY - touches[0].clientY;
+                lastTouchDist = Math.sqrt(dx * dx + dy * dy);
+                lastTouchMidX = (touches[0].clientX + touches[1].clientX) / 2;
+                lastTouchMidY = (touches[0].clientY + touches[1].clientY) / 2;
+            } else if (touches.length === 1) {
+                lastX = touches[0].clientX;
+                lastY = touches[0].clientY;
+            }
+        }, { passive: false });
+
+        this.canvas.addEventListener("touchmove", (e) => {
+            e.preventDefault();
+            const newTouches = Array.from(e.touches);
+
+            if (newTouches.length === 1) {
+                // Single finger: orbit
+                const dx = newTouches[0].clientX - lastX;
+                const dy = newTouches[0].clientY - lastY;
+                lastX = newTouches[0].clientX;
+                lastY = newTouches[0].clientY;
+                this.theta -= dx * 0.005;
+                this.phi = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, this.phi + dy * 0.005));
+                this._dirty = true;
+            } else if (newTouches.length === 2) {
+                // Pinch: zoom
+                const dx = newTouches[1].clientX - newTouches[0].clientX;
+                const dy = newTouches[1].clientY - newTouches[0].clientY;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                if (lastTouchDist > 0) {
+                    const scale = lastTouchDist / dist;
+                    this.distance *= scale;
+                    this.distance = Math.max(0.1, Math.min(10000, this.distance));
+                }
+                lastTouchDist = dist;
+
+                // Two-finger drag: pan
+                const midX = (newTouches[0].clientX + newTouches[1].clientX) / 2;
+                const midY = (newTouches[0].clientY + newTouches[1].clientY) / 2;
+                const panDx = midX - lastTouchMidX;
+                const panDy = midY - lastTouchMidY;
+                lastTouchMidX = midX;
+                lastTouchMidY = midY;
+
+                const panSpeed = this.distance * 0.002;
+                const right = this._getRight();
+                const up = this._getUp();
+                this.target[0] -= (panDx * right[0] - panDy * up[0]) * panSpeed;
+                this.target[1] -= (panDx * right[1] - panDy * up[1]) * panSpeed;
+                this.target[2] -= (panDx * right[2] - panDy * up[2]) * panSpeed;
+                this._dirty = true;
+            }
+
+            touches = newTouches;
+        }, { passive: false });
+
+        this.canvas.addEventListener("touchend", (e) => {
+            touches = Array.from(e.touches);
+            lastTouchDist = 0;
+        });
     }
 
-    // Call each frame to update auto-orbit and swoop
+    // Camera preset tour
+    setPresets(bbox) {
+        const cx = (bbox.min[0] + bbox.max[0]) / 2;
+        const cy = (bbox.min[1] + bbox.max[1]) / 2;
+        const cz = (bbox.min[2] + bbox.max[2]) / 2;
+        const dx = bbox.max[0] - bbox.min[0];
+        const dz = bbox.max[2] - bbox.min[2];
+        const maxExtent = Math.max(dx, bbox.max[1] - bbox.min[1], dz);
+
+        this.tourPresets = [
+            { // Aerial overview
+                theta: Math.PI / 4, phi: 1.0,
+                distance: maxExtent * 0.8,
+                target: [cx, cy, cz],
+                label: "Aerial Overview"
+            },
+            { // Street level - side A
+                theta: 0, phi: 0.15,
+                distance: maxExtent * 0.3,
+                target: [cx, cy, cz],
+                label: "Street Level"
+            },
+            { // Elevated perspective
+                theta: Math.PI * 0.75, phi: 0.5,
+                distance: maxExtent * 0.5,
+                target: [cx, cy, cz],
+                label: "Elevated View"
+            },
+            { // Close-up detail
+                theta: Math.PI * 1.5, phi: 0.25,
+                distance: maxExtent * 0.2,
+                target: [cx + dx * 0.2, cy, cz + dz * 0.1],
+                label: "Detail View"
+            },
+        ];
+    }
+
+    startTour() {
+        if (this.tourPresets.length === 0) return;
+        this.tourActive = true;
+        this.autoOrbit = false;
+        this.userInteracted = false;
+        this.tourIndex = 0;
+        this.tourStartTime = performance.now();
+        this.tourStartState = {
+            theta: this.theta,
+            phi: this.phi,
+            distance: this.distance,
+            target: [...this.target],
+        };
+    }
+
     update(dt) {
+        // Tour mode
+        if (this.tourActive) {
+            const elapsed = performance.now() - this.tourStartTime;
+            const cycleDuration = this.tourTransitionDuration + this.tourHoldDuration;
+            const cycleTime = elapsed % cycleDuration;
+
+            if (cycleTime < this.tourTransitionDuration) {
+                // Transitioning
+                let t = cycleTime / this.tourTransitionDuration;
+                t = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2; // ease in-out
+
+                const preset = this.tourPresets[this.tourIndex];
+                const start = this.tourStartState;
+
+                this.theta = start.theta + (preset.theta - start.theta) * t;
+                this.phi = start.phi + (preset.phi - start.phi) * t;
+                this.distance = start.distance + (preset.distance - start.distance) * t;
+                this.target[0] = start.target[0] + (preset.target[0] - start.target[0]) * t;
+                this.target[1] = start.target[1] + (preset.target[1] - start.target[1]) * t;
+                this.target[2] = start.target[2] + (preset.target[2] - start.target[2]) * t;
+            } else {
+                // Holding — gentle orbit
+                this.theta += 0.03 * dt;
+            }
+
+            // Check if cycle complete, advance to next preset
+            if (elapsed > cycleDuration) {
+                this.tourStartState = {
+                    theta: this.theta,
+                    phi: this.phi,
+                    distance: this.distance,
+                    target: [...this.target],
+                };
+                this.tourIndex = (this.tourIndex + 1) % this.tourPresets.length;
+                this.tourStartTime = performance.now();
+            }
+
+            this._dirty = true;
+            return;
+        }
+
         // Swoop animation
         if (this.swoopActive) {
             const elapsed = performance.now() - this.swoopStartTime;
             let t = Math.min(1, elapsed / this.swoopDuration);
-            // Ease out cubic
             t = 1 - Math.pow(1 - t, 3);
 
             this.distance = this.swoopStartDist + (this.swoopEndDist - this.swoopStartDist) * t;
             this.phi = this.swoopStartPhi + (this.swoopEndPhi - this.swoopStartPhi) * t;
-
-            // Orbit during swoop too (starts slow, ramps up)
             this.theta += this.autoOrbitSpeed * dt * t;
 
             if (elapsed >= this.swoopDuration) {
@@ -981,19 +1020,14 @@ class OrbitCamera {
             this._dirty = true;
         }
 
-        // Auto-orbit with cinematic zoom + elevation oscillation
+        // Auto-orbit with cinematic oscillation
         if (this.autoOrbit && !this.swoopActive) {
             this.cinematicTime += dt;
             this.theta += this.autoOrbitSpeed * dt;
-
-            // Slow zoom oscillation: zoom in 30%, then back out, period ~20s
             const zoomOsc = Math.sin(this.cinematicTime * 2 * Math.PI / 20);
             this.distance = this.baseDist * (1.0 + 0.3 * zoomOsc);
-
-            // Slow elevation oscillation: +/- 0.15 rad (~8 deg), period ~15s
             const phiOsc = Math.sin(this.cinematicTime * 2 * Math.PI / 15);
             this.phi = this.basePhi + 0.15 * phiOsc;
-
             this._dirty = true;
         }
     }
@@ -1001,11 +1035,10 @@ class OrbitCamera {
     startSwoop() {
         this.swoopActive = true;
         this.swoopStartTime = performance.now();
-        // Start far away and high up
         this.swoopStartDist = this.distance * 2.5;
-        this.swoopEndDist = this.distance * 0.5;  // zoom in much closer
-        this.swoopStartPhi = Math.PI / 2 - 0.1; // nearly top-down
-        this.swoopEndPhi = 0.25; // settle at ~14 degrees (more street-level)
+        this.swoopEndDist = this.distance * 0.5;
+        this.swoopStartPhi = Math.PI / 2 - 0.1;
+        this.swoopEndPhi = 0.25;
         this.distance = this.swoopStartDist;
         this.phi = this.swoopStartPhi;
     }
@@ -1101,7 +1134,6 @@ function lookAt(eye, target, up) {
     ]);
 }
 
-
 function mat4Multiply(a, b) {
     const out = new Float32Array(16);
     for (let i = 0; i < 4; i++) {
@@ -1118,45 +1150,41 @@ function mat4Multiply(a, b) {
 function mat4Invert(m) {
     const inv = new Float32Array(16);
     const te = m;
-
     const n11 = te[0], n21 = te[1], n31 = te[2], n41 = te[3];
     const n12 = te[4], n22 = te[5], n32 = te[6], n42 = te[7];
     const n13 = te[8], n23 = te[9], n33 = te[10], n43 = te[11];
     const n14 = te[12], n24 = te[13], n34 = te[14], n44 = te[15];
 
-    const t11 = n23 * n34 * n42 - n24 * n33 * n42 + n24 * n32 * n43 - n22 * n34 * n43 - n23 * n32 * n44 + n22 * n33 * n44;
-    const t12 = n14 * n33 * n42 - n13 * n34 * n42 - n14 * n32 * n43 + n12 * n34 * n43 + n13 * n32 * n44 - n12 * n33 * n44;
-    const t13 = n13 * n24 * n42 - n14 * n23 * n42 + n14 * n22 * n43 - n12 * n24 * n43 - n13 * n22 * n44 + n12 * n23 * n44;
-    const t14 = n14 * n23 * n32 - n13 * n24 * n32 - n14 * n22 * n33 + n12 * n24 * n33 + n13 * n22 * n34 - n12 * n23 * n34;
-
-    const det = n11 * t11 + n21 * t12 + n31 * t13 + n41 * t14;
+    const t11 = n23*n34*n42 - n24*n33*n42 + n24*n32*n43 - n22*n34*n43 - n23*n32*n44 + n22*n33*n44;
+    const t12 = n14*n33*n42 - n13*n34*n42 - n14*n32*n43 + n12*n34*n43 + n13*n32*n44 - n12*n33*n44;
+    const t13 = n13*n24*n42 - n14*n23*n42 + n14*n22*n43 - n12*n24*n43 - n13*n22*n44 + n12*n23*n44;
+    const t14 = n14*n23*n32 - n13*n24*n32 - n14*n22*n33 + n12*n24*n33 + n13*n22*n34 - n12*n23*n34;
+    const det = n11*t11 + n21*t12 + n31*t13 + n41*t14;
     if (det === 0) return new Float32Array(16);
+    const d = 1 / det;
 
-    const detInv = 1 / det;
-
-    inv[0] = t11 * detInv;
-    inv[1] = (n24 * n33 * n41 - n23 * n34 * n41 - n24 * n31 * n43 + n21 * n34 * n43 + n23 * n31 * n44 - n21 * n33 * n44) * detInv;
-    inv[2] = (n22 * n34 * n41 - n24 * n32 * n41 + n24 * n31 * n42 - n21 * n34 * n42 - n22 * n31 * n44 + n21 * n32 * n44) * detInv;
-    inv[3] = (n23 * n32 * n41 - n22 * n33 * n41 - n23 * n31 * n42 + n21 * n33 * n42 + n22 * n31 * n43 - n21 * n32 * n43) * detInv;
-    inv[4] = t12 * detInv;
-    inv[5] = (n13 * n34 * n41 - n14 * n33 * n41 + n14 * n31 * n43 - n11 * n34 * n43 - n13 * n31 * n44 + n11 * n33 * n44) * detInv;
-    inv[6] = (n14 * n32 * n41 - n12 * n34 * n41 - n14 * n31 * n42 + n11 * n34 * n42 + n12 * n31 * n44 - n11 * n32 * n44) * detInv;
-    inv[7] = (n12 * n33 * n41 - n13 * n32 * n41 + n13 * n31 * n42 - n11 * n33 * n42 - n12 * n31 * n43 + n11 * n32 * n43) * detInv;
-    inv[8] = t13 * detInv;
-    inv[9] = (n14 * n23 * n41 - n13 * n24 * n41 - n14 * n21 * n43 + n11 * n24 * n43 + n13 * n21 * n44 - n11 * n23 * n44) * detInv;
-    inv[10] = (n12 * n24 * n41 - n14 * n22 * n41 + n14 * n21 * n42 - n11 * n24 * n42 - n12 * n21 * n44 + n11 * n22 * n44) * detInv;
-    inv[11] = (n13 * n22 * n41 - n12 * n23 * n41 - n13 * n21 * n42 + n11 * n23 * n42 + n12 * n21 * n43 - n11 * n22 * n43) * detInv;
-    inv[12] = t14 * detInv;
-    inv[13] = (n13 * n24 * n31 - n14 * n23 * n31 + n14 * n21 * n33 - n11 * n24 * n33 - n13 * n21 * n34 + n11 * n23 * n34) * detInv;
-    inv[14] = (n14 * n22 * n31 - n12 * n24 * n31 - n14 * n21 * n32 + n11 * n24 * n32 + n12 * n21 * n34 - n11 * n22 * n34) * detInv;
-    inv[15] = (n12 * n23 * n31 - n13 * n22 * n31 + n13 * n21 * n32 - n11 * n23 * n32 - n12 * n21 * n33 + n11 * n22 * n33) * detInv;
-
+    inv[0] = t11*d;
+    inv[1] = (n24*n33*n41 - n23*n34*n41 - n24*n31*n43 + n21*n34*n43 + n23*n31*n44 - n21*n33*n44)*d;
+    inv[2] = (n22*n34*n41 - n24*n32*n41 + n24*n31*n42 - n21*n34*n42 - n22*n31*n44 + n21*n32*n44)*d;
+    inv[3] = (n23*n32*n41 - n22*n33*n41 - n23*n31*n42 + n21*n33*n42 + n22*n31*n43 - n21*n32*n43)*d;
+    inv[4] = t12*d;
+    inv[5] = (n13*n34*n41 - n14*n33*n41 + n14*n31*n43 - n11*n34*n43 - n13*n31*n44 + n11*n33*n44)*d;
+    inv[6] = (n14*n32*n41 - n12*n34*n41 - n14*n31*n42 + n11*n34*n42 + n12*n31*n44 - n11*n32*n44)*d;
+    inv[7] = (n12*n33*n41 - n13*n32*n41 + n13*n31*n42 - n11*n33*n42 - n12*n31*n43 + n11*n32*n43)*d;
+    inv[8] = t13*d;
+    inv[9] = (n14*n23*n41 - n13*n24*n41 - n14*n21*n43 + n11*n24*n43 + n13*n21*n44 - n11*n23*n44)*d;
+    inv[10] = (n12*n24*n41 - n14*n22*n41 + n14*n21*n42 - n11*n24*n42 - n12*n21*n44 + n11*n22*n44)*d;
+    inv[11] = (n13*n22*n41 - n12*n23*n41 - n13*n21*n42 + n11*n23*n42 + n12*n21*n43 - n11*n22*n43)*d;
+    inv[12] = t14*d;
+    inv[13] = (n13*n24*n31 - n14*n23*n31 + n14*n21*n33 - n11*n24*n33 - n13*n21*n34 + n11*n23*n34)*d;
+    inv[14] = (n14*n22*n31 - n12*n24*n31 - n14*n21*n32 + n11*n24*n32 + n12*n21*n34 - n11*n22*n34)*d;
+    inv[15] = (n12*n23*n31 - n13*n22*n31 + n13*n21*n32 - n11*n23*n32 - n12*n21*n33 + n11*n22*n33)*d;
     return inv;
 }
 
 
 // ============================================================
-// Compute bounding box
+// Bounding box
 // ============================================================
 
 function computeBBox(positions) {
@@ -1184,14 +1212,10 @@ class IntroAnimation {
     constructor() {
         this.active = false;
         this.startTime = 0;
-
-        // Timeline (in seconds):
-        // 0-3s:   Camera swoops in close, points visible
-        // 2.5-9s: Radial morph from center outward
         this.swoopDuration = 3.0;
-        this.morphDelay = 2.5;      // start morph after 2.5 seconds
-        this.morphDuration = 6.0;   // morph over 6 seconds
-        this.radialProgress = 0;    // 0 = no morph, 2 = fully revealed everywhere
+        this.morphDelay = 2.5;
+        this.morphDuration = 6.0;
+        this.radialProgress = 0;
     }
 
     start() {
@@ -1202,20 +1226,15 @@ class IntroAnimation {
 
     update() {
         if (!this.active) return;
-
         const elapsed = (performance.now() - this.startTime) / 1000;
 
-        // Radial morph progress
         if (elapsed > this.morphDelay) {
             const morphElapsed = elapsed - this.morphDelay;
             let t = Math.min(1, morphElapsed / this.morphDuration);
-            // Ease in-out
             t = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
-            // Map to 0-2 range (need >1 to reach screen edges since screenDist can be ~1.4)
             this.radialProgress = t * 2.2;
         }
 
-        // Done when morph is complete
         if (elapsed > this.morphDelay + this.morphDuration + 0.5) {
             this.radialProgress = 2.2;
             this.active = false;
@@ -1237,8 +1256,10 @@ async function init() {
     const morphLabel = document.getElementById("morph-label");
     const infoEl = document.getElementById("info");
     const dropZone = document.getElementById("drop-zone");
+    const tourBtn = document.getElementById("tour-btn");
+    const fsBtn = document.getElementById("fs-btn");
 
-    const renderScale = 0.75; // Render at 75% resolution for performance
+    const renderScale = 0.85;
     function resize() {
         canvas.width = Math.round(window.innerWidth * devicePixelRatio * renderScale);
         canvas.height = Math.round(window.innerHeight * devicePixelRatio * renderScale);
@@ -1249,20 +1270,21 @@ async function init() {
     const renderer = new SplatRenderer(canvas);
     const camera = new OrbitCamera(canvas);
     const intro = new IntroAnimation();
+    const panoSystem = new PanoWaypointSystem(renderer.gl, canvas);
 
     let rawSplatData = null;
+    let sortPending = false;
+    let lastSortTime = 0;
     let lastSortTheta = 0;
     let lastSortPhi = 0;
-    let sortPending = false;
     let lastFrameTime = performance.now();
+    const SORT_INTERVAL = 200; // ms — throttle sorts
 
-    // Sort worker
+    // Sort worker — positions stored in worker, only view matrix sent per sort
     const sortWorker = new Worker("src/sort-worker.js");
     sortWorker.onmessage = function(e) {
         if (!rawSplatData) return;
-        const sorted = e.data.sortedIndices;
-        // Only upload sort indices (80MB) instead of reordering all data (1.1GB)
-        renderer.updateSortOrder(sorted);
+        renderer.updateSortOrder(e.data.sortedIndices);
         sortPending = false;
     };
 
@@ -1275,23 +1297,30 @@ async function init() {
 
             const bbox = computeBBox(rawSplatData.positions);
             camera.fitToScene(bbox);
+            camera.setPresets(bbox);
 
-            // Upload original data to textures (once)
             renderer.uploadSplatData(rawSplatData);
 
-            // Initial sort - just upload sort indices
+            // Send positions to worker once (stored permanently)
+            sortWorker.postMessage({
+                type: "init",
+                positions: rawSplatData.positions,
+                count: rawSplatData.count,
+            });
+
+            // Initial sort
             const viewMatrix = camera.getViewMatrix();
             const sorted = sortSplats(rawSplatData, viewMatrix);
             renderer.updateSortOrder(sorted);
             lastSortTheta = camera.theta;
             lastSortPhi = camera.phi;
+            lastSortTime = performance.now();
 
-            infoEl.textContent = `${rawSplatData.count.toLocaleString()} splats | Drag to orbit, scroll to zoom, right-drag to pan`;
+            infoEl.textContent = `${rawSplatData.count.toLocaleString()} splats`;
 
             loadingOverlay.classList.add("hidden");
             uiOverlay.style.display = "flex";
 
-            // Start the intro sequence
             camera.startSwoop();
             intro.start();
 
@@ -1302,25 +1331,17 @@ async function init() {
     }
 
     // Drag and drop
-    window.addEventListener("dragover", (e) => {
-        e.preventDefault();
-        dropZone.classList.add("active");
-    });
-    window.addEventListener("dragleave", () => {
-        dropZone.classList.remove("active");
-    });
+    window.addEventListener("dragover", (e) => { e.preventDefault(); dropZone.classList.add("active"); });
+    window.addEventListener("dragleave", () => { dropZone.classList.remove("active"); });
     window.addEventListener("drop", (e) => {
         e.preventDefault();
         dropZone.classList.remove("active");
         const file = e.dataTransfer.files[0];
-        if (file && file.name.endsWith(".splat")) {
-            loadAndDisplay(file);
-        }
+        if (file && file.name.endsWith(".splat")) loadAndDisplay(file);
     });
 
     // UI controls
     playBtn.addEventListener("click", () => {
-        // Toggle radial morph replay
         if (intro.radialProgress >= 2) {
             intro.radialProgress = 0;
             intro.start();
@@ -1332,21 +1353,127 @@ async function init() {
         intro.radialProgress = (morphSlider.value / 100) * 2.2;
     });
 
-    // Auto-load: check URL param first, then try default file, then try chunks
+    // Tour button
+    if (tourBtn) {
+        tourBtn.addEventListener("click", () => {
+            if (camera.tourActive) {
+                camera.tourActive = false;
+                tourBtn.textContent = "Tour";
+            } else {
+                camera.startTour();
+                tourBtn.textContent = "Stop";
+            }
+        });
+    }
+
+    // Waypoint click handler
+    canvas.addEventListener("click", async (e) => {
+        if (panoSystem.active || panoSystem.transitioning) return;
+
+        const proj = camera.getProjectionMatrix();
+        const view = camera.getViewMatrix();
+        const hit = panoSystem.hitTest(proj, view, e.clientX, e.clientY);
+        if (hit) {
+            camera.userInteracted = true;
+            camera.autoOrbit = false;
+            camera.tourActive = false;
+            await panoSystem.enterPanorama(hit.id, camera);
+        }
+    });
+
+    // Pano mode: mouse drag for look-around
+    let panoDragging = false;
+    let panoLastX = 0, panoLastY = 0;
+    canvas.addEventListener("mousedown", (e) => {
+        if (panoSystem.active) {
+            panoDragging = true;
+            panoLastX = e.clientX;
+            panoLastY = e.clientY;
+        }
+    });
+    window.addEventListener("mouseup", () => { panoDragging = false; });
+    window.addEventListener("mousemove", (e) => {
+        if (panoDragging && panoSystem.active) {
+            panoSystem.handlePanoInput(e.clientX - panoLastX, e.clientY - panoLastY, 0);
+            panoLastX = e.clientX;
+            panoLastY = e.clientY;
+        }
+    });
+    canvas.addEventListener("wheel", (e) => {
+        if (panoSystem.active) {
+            e.preventDefault();
+            panoSystem.handlePanoInput(0, 0, e.deltaY);
+        }
+    }, { passive: false });
+
+    // Pano touch controls
+    let panoTouchLastX = 0, panoTouchLastY = 0;
+    canvas.addEventListener("touchstart", (e) => {
+        if (panoSystem.active && e.touches.length === 1) {
+            panoTouchLastX = e.touches[0].clientX;
+            panoTouchLastY = e.touches[0].clientY;
+        }
+    });
+    canvas.addEventListener("touchmove", (e) => {
+        if (panoSystem.active && e.touches.length === 1) {
+            e.preventDefault();
+            const dx = e.touches[0].clientX - panoTouchLastX;
+            const dy = e.touches[0].clientY - panoTouchLastY;
+            panoSystem.handlePanoInput(dx, dy, 0);
+            panoTouchLastX = e.touches[0].clientX;
+            panoTouchLastY = e.touches[0].clientY;
+        }
+    }, { passive: false });
+
+    // Back button / Escape to exit pano
+    const backBtn = document.getElementById("back-btn");
+    if (backBtn) {
+        backBtn.addEventListener("click", () => panoSystem.exitPanorama());
+    }
+    window.addEventListener("keydown", (e) => {
+        if (e.key === "Escape" && (panoSystem.active || panoSystem.transitioning)) {
+            panoSystem.exitPanorama();
+        }
+    });
+
+    // Fullscreen button
+    if (fsBtn) {
+        fsBtn.addEventListener("click", () => {
+            if (!document.fullscreenElement) {
+                document.documentElement.requestFullscreen().catch(() => {});
+                fsBtn.textContent = "Exit";
+            } else {
+                document.exitFullscreen();
+                fsBtn.textContent = "Fullscreen";
+            }
+        });
+
+        document.addEventListener("fullscreenchange", () => {
+            fsBtn.textContent = document.fullscreenElement ? "Exit" : "Fullscreen";
+        });
+    }
+
+    // Auto-load: ?url= param > STW-SCAN.splat > STW-SCAN.splat.000 (chunked) > test_scene.splat > prompt
     const params = new URLSearchParams(window.location.search);
     const splatUrl = params.get("url");
     if (splatUrl) {
         loadAndDisplay(splatUrl);
     } else {
-        // Try single file first, then chunked
-        fetch("STW-SCAN.splat", { method: "HEAD" }).then(r => {
-            if (r.ok) loadAndDisplay("STW-SCAN.splat");
-            else return fetch("STW-SCAN.splat.000", { method: "HEAD" });
-        }).then(r => {
-            if (r && r.ok) loadAndDisplay("STW-SCAN.splat");
-        }).catch(() => {
+        (async () => {
+            const candidates = ["STW-SCAN.splat", "STW-SCAN.splat.000", "test_scene.splat"];
+            for (const name of candidates) {
+                try {
+                    const r = await fetch(name, { method: "HEAD" });
+                    if (r.ok) {
+                        // For chunked, load the base name (loadSplatFile handles .000 probing)
+                        const loadName = name.endsWith(".000") ? name.replace(".000", "") : name;
+                        loadAndDisplay(loadName);
+                        return;
+                    }
+                } catch (e) { /* next */ }
+            }
             document.getElementById("loading-text").textContent = "Drop a .splat file to view";
-        });
+        })();
     }
 
     // FPS tracking
@@ -1359,11 +1486,10 @@ async function init() {
         requestAnimationFrame(frame);
 
         const now = performance.now();
-        const dt = Math.min(0.1, (now - lastFrameTime) / 1000); // seconds, capped
+        const dt = Math.min(0.1, (now - lastFrameTime) / 1000);
         lastFrameTime = now;
-        const time = now / 1000;
 
-        // FPS counter
+        // FPS
         fpsFrameCount++;
         if (now - fpsLastTime > 1000) {
             fpsDisplay = Math.round(fpsFrameCount * 1000 / (now - fpsLastTime));
@@ -1374,39 +1500,47 @@ async function init() {
             }
         }
 
-        // Update camera (auto-orbit + swoop)
         camera.update(dt);
-
-        // Update intro animation
         intro.update();
 
-        // Set renderer state
         renderer.radialProgress = intro.radialProgress;
-        renderer.morphProgress = Math.min(1, intro.radialProgress); // legacy uniform
+        renderer.morphProgress = Math.min(1, intro.radialProgress);
 
-        // Update slider UI
         const displayPct = Math.min(100, Math.round(intro.radialProgress / 2.2 * 100));
         morphSlider.value = displayPct;
         morphLabel.textContent = `${displayPct}%`;
         playBtn.innerHTML = intro.active ? "&#9646;&#9646;" : "&#9654;";
 
-        // Re-sort when camera rotates significantly (off main thread)
-        if (rawSplatData && !sortPending &&
-            (Math.abs(camera.theta - lastSortTheta) > 0.1 || Math.abs(camera.phi - lastSortPhi) > 0.1)) {
+        // Update panorama system
+        panoSystem.update(camera);
+
+        // Show/hide back button
+        if (backBtn) {
+            backBtn.style.display = (panoSystem.active || (panoSystem.transitioning && panoSystem.panoOpacity > 0)) ? "flex" : "none";
+        }
+
+        // Throttled sort — max every 200ms, only when camera moves
+        if (rawSplatData && !sortPending && !panoSystem.active && (now - lastSortTime > SORT_INTERVAL) &&
+            (Math.abs(camera.theta - lastSortTheta) > 0.05 || Math.abs(camera.phi - lastSortPhi) > 0.05)) {
             sortPending = true;
             lastSortTheta = camera.theta;
             lastSortPhi = camera.phi;
-            const viewMatrix = camera.getViewMatrix();
+            lastSortTime = now;
             sortWorker.postMessage({
-                positions: rawSplatData.positions,
-                viewMatrix: viewMatrix,
-                count: rawSplatData.count,
+                type: "sort",
+                viewMatrix: camera.getViewMatrix(),
             });
         }
 
         const proj = camera.getProjectionMatrix();
         const view = camera.getViewMatrix();
-        renderer.render(proj, view, time);
+        renderer.render(proj, view);
+
+        // Render waypoint markers (on top of splats)
+        panoSystem.renderMarkers(proj, view, now / 1000);
+
+        // Render panorama overlay (crossfade on top of everything)
+        panoSystem.renderPanorama(proj, view);
     }
 
     requestAnimationFrame(frame);

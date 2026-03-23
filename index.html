@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
     <title>South Tacoma Way - 3D Point Cloud Viewer | Psomas</title>
     <meta name="description" content="Interactive 3D Gaussian Splat visualization of the South Tacoma Way corridor">
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔭</text></svg>">
@@ -14,6 +14,7 @@
             color: #fff;
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             overflow: hidden;
+            touch-action: none;
         }
 
         canvas {
@@ -29,34 +30,53 @@
             transform: translateX(-50%);
             display: flex;
             align-items: center;
-            gap: 12px;
+            gap: 10px;
             background: rgba(0, 0, 0, 0.7);
             backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
             border: 1px solid rgba(255, 255, 255, 0.15);
             border-radius: 12px;
-            padding: 12px 20px;
+            padding: 10px 16px;
             z-index: 10;
             user-select: none;
+            -webkit-user-select: none;
         }
 
-        #play-btn {
-            width: 36px;
-            height: 36px;
+        .ui-btn {
+            height: 32px;
             border: none;
-            background: rgba(255, 255, 255, 0.15);
-            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.12);
+            border-radius: 6px;
             color: #fff;
-            font-size: 16px;
+            font-size: 12px;
+            font-weight: 500;
             cursor: pointer;
             display: flex;
             align-items: center;
             justify-content: center;
+            padding: 0 12px;
             transition: background 0.2s;
+            white-space: nowrap;
+            letter-spacing: 0.3px;
         }
-        #play-btn:hover { background: rgba(255, 255, 255, 0.25); }
+        .ui-btn:hover { background: rgba(255, 255, 255, 0.22); }
+        .ui-btn:active { background: rgba(255, 255, 255, 0.3); }
+
+        #play-btn {
+            width: 32px;
+            padding: 0;
+            border-radius: 50%;
+            font-size: 14px;
+        }
+
+        .ui-divider {
+            width: 1px;
+            height: 20px;
+            background: rgba(255, 255, 255, 0.15);
+        }
 
         #morph-slider {
-            width: 240px;
+            width: 160px;
             height: 4px;
             -webkit-appearance: none;
             appearance: none;
@@ -67,52 +87,66 @@
         }
         #morph-slider::-webkit-slider-thumb {
             -webkit-appearance: none;
-            width: 16px;
-            height: 16px;
+            width: 14px;
+            height: 14px;
             border-radius: 50%;
             background: #fff;
             cursor: pointer;
         }
 
         #morph-label {
-            font-size: 13px;
-            opacity: 0.7;
-            min-width: 40px;
+            font-size: 11px;
+            opacity: 0.6;
+            min-width: 32px;
             text-align: right;
         }
 
         #loading-overlay {
             position: fixed;
             inset: 0;
-            background: #111;
+            background: #0a0a0a;
             display: flex;
             flex-direction: column;
             align-items: center;
             justify-content: center;
             z-index: 100;
-            transition: opacity 0.5s;
+            transition: opacity 0.8s;
         }
         #loading-overlay.hidden {
             opacity: 0;
             pointer-events: none;
         }
 
+        .loading-brand {
+            font-size: 28px;
+            font-weight: 300;
+            letter-spacing: 4px;
+            margin-bottom: 8px;
+            opacity: 0.9;
+        }
+        .loading-project {
+            font-size: 13px;
+            opacity: 0.4;
+            letter-spacing: 1px;
+            margin-bottom: 32px;
+        }
+
         #loading-text {
-            font-size: 16px;
-            opacity: 0.7;
-            margin-bottom: 16px;
+            font-size: 13px;
+            opacity: 0.5;
+            margin-bottom: 12px;
         }
 
         #loading-bar-bg {
-            width: 300px;
-            height: 4px;
-            background: rgba(255, 255, 255, 0.1);
-            border-radius: 2px;
+            width: 260px;
+            height: 2px;
+            background: rgba(255, 255, 255, 0.08);
+            border-radius: 1px;
         }
         #loading-bar {
             height: 100%;
-            background: #fff;
-            border-radius: 2px;
+            background: rgba(255, 255, 255, 0.6);
+            border-radius: 1px;
             width: 0%;
             transition: width 0.3s;
         }
@@ -121,9 +155,10 @@
             position: fixed;
             top: 16px;
             left: 16px;
-            font-size: 12px;
-            opacity: 0.5;
+            font-size: 11px;
+            opacity: 0.35;
             z-index: 10;
+            font-variant-numeric: tabular-nums;
         }
 
         #title-overlay {
@@ -141,23 +176,45 @@
             to { opacity: 1; transform: translateY(0); }
         }
         #title-overlay h1 {
-            font-size: 18px;
+            font-size: 20px;
             font-weight: 600;
             letter-spacing: 0.5px;
-            text-shadow: 0 2px 8px rgba(0,0,0,0.6);
+            text-shadow: 0 2px 12px rgba(0,0,0,0.7);
             margin-bottom: 4px;
         }
         #title-overlay .subtitle {
             font-size: 12px;
             opacity: 0.6;
-            text-shadow: 0 1px 4px rgba(0,0,0,0.6);
+            text-shadow: 0 1px 6px rgba(0,0,0,0.7);
             letter-spacing: 0.3px;
         }
         #title-overlay .branding {
             font-size: 11px;
-            opacity: 0.4;
+            opacity: 0.35;
             margin-top: 8px;
             text-shadow: 0 1px 4px rgba(0,0,0,0.6);
+            letter-spacing: 2px;
+            text-transform: uppercase;
+        }
+
+        #help-hint {
+            position: fixed;
+            bottom: 80px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 11px;
+            opacity: 0;
+            z-index: 10;
+            pointer-events: none;
+            animation: fadeHint 8s ease-out 5s forwards;
+            text-shadow: 0 1px 4px rgba(0,0,0,0.6);
+            white-space: nowrap;
+        }
+        @keyframes fadeHint {
+            0% { opacity: 0; }
+            10% { opacity: 0.5; }
+            70% { opacity: 0.5; }
+            100% { opacity: 0; }
         }
 
         #drop-zone {
@@ -171,20 +228,39 @@
             font-size: 24px;
         }
         #drop-zone.active { display: flex; }
+
+        /* Responsive: stack buttons on small screens */
+        @media (max-width: 600px) {
+            #ui-overlay {
+                flex-wrap: wrap;
+                justify-content: center;
+                max-width: 90vw;
+                bottom: 12px;
+                padding: 8px 12px;
+                gap: 6px;
+            }
+            #morph-slider { width: 120px; }
+            #title-overlay h1 { font-size: 16px; }
+        }
     </style>
 </head>
 <body>
     <canvas id="canvas"></canvas>
 
     <div id="loading-overlay">
-        <div id="loading-text">Loading 3D point cloud...</div>
+        <div class="loading-brand">PSOMAS</div>
+        <div class="loading-project">South Tacoma Way &mdash; Vision Zero Corridor</div>
+        <div id="loading-text">Preparing 3D visualization...</div>
         <div id="loading-bar-bg"><div id="loading-bar"></div></div>
     </div>
 
     <div id="ui-overlay" style="display: none;">
-        <button id="play-btn">&#9654;</button>
+        <button id="play-btn" class="ui-btn">&#9654;</button>
         <input type="range" id="morph-slider" min="0" max="100" value="0">
         <span id="morph-label">0%</span>
+        <div class="ui-divider"></div>
+        <button id="tour-btn" class="ui-btn">Tour</button>
+        <button id="fs-btn" class="ui-btn">Fullscreen</button>
     </div>
 
     <div id="info"></div>
@@ -194,6 +270,12 @@
         <div class="subtitle">Vision Zero Corridor &mdash; 3D Point Cloud</div>
         <div class="branding">Psomas</div>
     </div>
+
+    <div id="help-hint">Drag to orbit &bull; Scroll to zoom &bull; Right-drag to pan &bull; Click markers for 360 view</div>
+
+    <button id="back-btn" class="ui-btn" style="display:none; position:fixed; top:24px; left:24px; z-index:20; padding:0 16px; height:36px; font-size:13px;">
+        &larr; Back to 3D
+    </button>
 
     <div id="drop-zone">Drop .splat file here</div>
 

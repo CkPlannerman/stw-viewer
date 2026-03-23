@@ -1,0 +1,663 @@
+/**
+ * Panorama Waypoint System
+ *
+ * Renders clickable waypoint markers in 3D space. On click, flies camera
+ * to the waypoint position, then crossfades into an immersive 360 panorama.
+ * User can look around in the panorama, then exit back to the point cloud.
+ *
+ * Uses equirectangular → cubemap conversion for seamless 360 viewing.
+ */
+
+// Waypoint data: scan positions in viewer space
+// Computed from RegistrationInfos.csv with centroid offset (16.99, -1.38, 103.73)
+const WAYPOINTS = [
+    { id: 1, pos: [-16.99, 1.38, -103.73], file: "1.jpeg" },
+    { id: 2, pos: [-17.04, 1.32, -95.58], file: "2.jpeg" },
+    { id: 3, pos: [-17.03, 1.37, -87.32], file: "3.jpeg" },
+    { id: 4, pos: [-25.02, 1.40, -80.10], file: "4.jpeg" },
+    { id: 5, pos: [-32.23, 1.29, -80.11], file: "5.jpeg" },
+    { id: 6, pos: [-36.43, 1.44, -62.45], file: "6.jpeg" },
+    { id: 7, pos: [-27.98, 1.39, -62.41], file: "7.jpeg" },
+    { id: 8, pos: [-20.79, 1.39, -57.01], file: "8.jpeg" },
+    { id: 9, pos: [-17.05, 1.23, -49.75], file: "9.jpeg" },
+    { id: 10, pos: [-7.03, 1.29, -47.76], file: "10.jpeg" },
+    { id: 11, pos: [-6.36, 1.37, -55.45], file: "11.jpeg" },
+    { id: 12, pos: [-4.19, 1.41, -60.81], file: "12.jpeg" },
+    { id: 13, pos: [2.39, 1.39, -62.62], file: "13.jpeg" },
+    { id: 14, pos: [9.14, 1.27, -62.84], file: "14.jpeg" },
+    { id: 15, pos: [15.56, 1.35, -80.55], file: "15.jpeg" },
+    { id: 16, pos: [4.06, 1.32, -80.79], file: "16.jpeg" },
+    { id: 17, pos: [0.95, 1.33, -81.04], file: "17.jpeg" },
+    { id: 18, pos: [-2.66, 1.34, -86.14], file: "18.jpeg" },
+    { id: 19, pos: [-6.72, 1.29, -89.24], file: "19.jpeg" },
+    { id: 20, pos: [-6.90, 1.39, -100.14], file: "20.jpeg" },
+    { id: 21, pos: [-53.47, 1.54, -71.59], file: "21.jpeg" },
+    { id: 22, pos: [-16.46, 1.22, -36.06], file: "22.jpeg" },
+    { id: 23, pos: [31.30, 1.57, -71.35], file: "23.jpeg" },
+];
+
+// ============================================================
+// Waypoint Marker Renderer (billboarded quads in 3D)
+// ============================================================
+
+const MARKER_VERT = `#version 300 es
+precision highp float;
+
+uniform mat4 u_projection;
+uniform mat4 u_view;
+uniform vec2 u_viewport;
+uniform vec3 u_markerPos;
+uniform float u_pulse;      // 0-1 pulsing animation
+uniform float u_hover;      // 1 if hovered
+uniform float u_scale;
+
+in vec2 a_pos;
+out vec2 v_uv;
+out float v_pulse;
+out float v_hover;
+
+void main() {
+    vec4 center = u_projection * u_view * vec4(u_markerPos, 1.0);
+
+    // Skip if behind camera
+    if (center.w < 0.1) {
+        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+        return;
+    }
+
+    // Billboard size in pixels, with distance attenuation
+    float dist = center.w;
+    float baseSize = 20.0 * u_scale;
+    float size = baseSize / dist;
+    size = clamp(size, 6.0, 40.0); // min/max pixel size
+    size *= (1.0 + 0.15 * u_pulse); // pulse
+
+    vec2 offset = a_pos * size;
+    vec2 ndcOffset = offset * 2.0 / u_viewport;
+
+    gl_Position = vec4(
+        center.x / center.w + ndcOffset.x,
+        center.y / center.w + ndcOffset.y,
+        center.z / center.w - 0.001, // slight depth bias to render on top
+        1.0
+    );
+
+    v_uv = a_pos;
+    v_pulse = u_pulse;
+    v_hover = u_hover;
+}
+`;
+
+const MARKER_FRAG = `#version 300 es
+precision highp float;
+
+in vec2 v_uv;
+in float v_pulse;
+in float v_hover;
+out vec4 fragColor;
+
+void main() {
+    float dist = length(v_uv);
+
+    // Outer ring
+    float ring = smoothstep(0.9, 0.75, dist) - smoothstep(0.65, 0.5, dist);
+    // Inner dot
+    float dot = smoothstep(0.35, 0.2, dist);
+    // Glow
+    float glow = smoothstep(1.0, 0.3, dist) * 0.3;
+
+    float alpha = max(max(ring, dot), glow);
+    alpha *= (0.7 + 0.3 * v_pulse);
+
+    // White with slight blue tint, brighter on hover
+    vec3 color = mix(vec3(0.85, 0.9, 1.0), vec3(1.0, 1.0, 1.0), v_hover);
+    alpha = mix(alpha, min(alpha * 1.5, 1.0), v_hover);
+
+    if (alpha < 0.01) discard;
+
+    fragColor = vec4(color * alpha, alpha);
+}
+`;
+
+
+// ============================================================
+// 360 Panorama Renderer
+// ============================================================
+
+const PANO_VERT = `#version 300 es
+precision highp float;
+in vec2 a_pos;
+out vec2 v_ndc;
+void main() {
+    v_ndc = a_pos;
+    gl_Position = vec4(a_pos, 0.0, 1.0);
+}
+`;
+
+const PANO_FRAG = `#version 300 es
+precision highp float;
+in vec2 v_ndc;
+out vec4 fragColor;
+
+uniform mat4 u_invViewProj;
+uniform samplerCube u_panoCube;
+uniform float u_opacity;
+
+void main() {
+    vec4 nearPoint = u_invViewProj * vec4(v_ndc, -1.0, 1.0);
+    vec4 farPoint  = u_invViewProj * vec4(v_ndc,  1.0, 1.0);
+    vec3 rayDir = normalize(farPoint.xyz / farPoint.w - nearPoint.xyz / nearPoint.w);
+    vec3 color = texture(u_panoCube, rayDir).rgb;
+    fragColor = vec4(color, u_opacity);
+}
+`;
+
+
+export class PanoWaypointSystem {
+    constructor(gl, canvas) {
+        this.gl = gl;
+        this.canvas = canvas;
+        this.waypoints = WAYPOINTS;
+
+        // State
+        this.active = false;          // true when in panorama mode
+        this.transitioning = false;   // true during fly-to / crossfade
+        this.transitionStart = 0;
+        this.transitionDuration = 1500; // ms for camera fly
+        this.fadeDuration = 500;        // ms for crossfade
+        this.currentWaypoint = null;
+        this.hoveredWaypoint = null;
+        this.panoOpacity = 0;
+
+        // Panorama camera (independent from main camera)
+        this.panoTheta = 0;
+        this.panoPhi = 0;
+        this.panoFov = 75;
+
+        // Loaded panorama cubemaps (cached)
+        this.panoCubemaps = {};
+        this.loadingPano = null;
+
+        this._initMarkerRenderer();
+        this._initPanoRenderer();
+        this._initPickBuffer();
+    }
+
+    _initMarkerRenderer() {
+        const gl = this.gl;
+
+        const vs = gl.createShader(gl.VERTEX_SHADER);
+        gl.shaderSource(vs, MARKER_VERT);
+        gl.compileShader(vs);
+        if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS))
+            console.error("Marker VS:", gl.getShaderInfoLog(vs));
+
+        const fs = gl.createShader(gl.FRAGMENT_SHADER);
+        gl.shaderSource(fs, MARKER_FRAG);
+        gl.compileShader(fs);
+        if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS))
+            console.error("Marker FS:", gl.getShaderInfoLog(fs));
+
+        this.markerProgram = gl.createProgram();
+        gl.attachShader(this.markerProgram, vs);
+        gl.attachShader(this.markerProgram, fs);
+        gl.linkProgram(this.markerProgram);
+
+        this.m_projection = gl.getUniformLocation(this.markerProgram, "u_projection");
+        this.m_view = gl.getUniformLocation(this.markerProgram, "u_view");
+        this.m_viewport = gl.getUniformLocation(this.markerProgram, "u_viewport");
+        this.m_markerPos = gl.getUniformLocation(this.markerProgram, "u_markerPos");
+        this.m_pulse = gl.getUniformLocation(this.markerProgram, "u_pulse");
+        this.m_hover = gl.getUniformLocation(this.markerProgram, "u_hover");
+        this.m_scale = gl.getUniformLocation(this.markerProgram, "u_scale");
+
+        // Quad VAO
+        this.markerVAO = gl.createVertexArray();
+        gl.bindVertexArray(this.markerVAO);
+        const buf = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+            -1, -1,  1, -1,  -1, 1,  -1, 1,  1, -1,  1, 1,
+        ]), gl.STATIC_DRAW);
+        const loc = gl.getAttribLocation(this.markerProgram, "a_pos");
+        gl.enableVertexAttribArray(loc);
+        gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+        gl.bindVertexArray(null);
+    }
+
+    _initPanoRenderer() {
+        const gl = this.gl;
+
+        const vs = gl.createShader(gl.VERTEX_SHADER);
+        gl.shaderSource(vs, PANO_VERT);
+        gl.compileShader(vs);
+
+        const fs = gl.createShader(gl.FRAGMENT_SHADER);
+        gl.shaderSource(fs, PANO_FRAG);
+        gl.compileShader(fs);
+
+        this.panoProgram = gl.createProgram();
+        gl.attachShader(this.panoProgram, vs);
+        gl.attachShader(this.panoProgram, fs);
+        gl.linkProgram(this.panoProgram);
+
+        this.p_invViewProj = gl.getUniformLocation(this.panoProgram, "u_invViewProj");
+        this.p_panoCube = gl.getUniformLocation(this.panoProgram, "u_panoCube");
+        this.p_opacity = gl.getUniformLocation(this.panoProgram, "u_opacity");
+
+        // Reuse a fullscreen quad
+        this.panoVAO = gl.createVertexArray();
+        gl.bindVertexArray(this.panoVAO);
+        const buf = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+            -1, -1,  1, -1,  -1, 1,  -1, 1,  1, -1,  1, 1,
+        ]), gl.STATIC_DRAW);
+        const loc = gl.getAttribLocation(this.panoProgram, "a_pos");
+        gl.enableVertexAttribArray(loc);
+        gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+        gl.bindVertexArray(null);
+    }
+
+    _initPickBuffer() {
+        // Mouse position for hover detection
+        this._mouseX = 0;
+        this._mouseY = 0;
+
+        this.canvas.addEventListener("mousemove", (e) => {
+            this._mouseX = e.clientX;
+            this._mouseY = e.clientY;
+        });
+    }
+
+    // Convert equirectangular image to cubemap (reused from SkyRenderer pattern)
+    _equirectToCubemap(img, faceSize) {
+        const gl = this.gl;
+        const tmpCanvas = document.createElement("canvas");
+        tmpCanvas.width = img.width;
+        tmpCanvas.height = img.height;
+        const ctx = tmpCanvas.getContext("2d");
+        ctx.drawImage(img, 0, 0);
+        const srcData = ctx.getImageData(0, 0, img.width, img.height).data;
+        const srcW = img.width, srcH = img.height;
+
+        const cubemap = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_CUBE_MAP, cubemap);
+
+        const faces = [
+            (u, v) => [ 1, -v, -u],
+            (u, v) => [-1, -v,  u],
+            (u, v) => [ u,  1,  v],
+            (u, v) => [ u, -1, -v],
+            (u, v) => [ u, -v,  1],
+            (u, v) => [-u, -v, -1],
+        ];
+
+        for (let face = 0; face < 6; face++) {
+            const faceData = new Uint8Array(faceSize * faceSize * 4);
+            const dirFn = faces[face];
+
+            for (let y = 0; y < faceSize; y++) {
+                for (let x = 0; x < faceSize; x++) {
+                    const u = 2 * (x + 0.5) / faceSize - 1;
+                    const v = 2 * (y + 0.5) / faceSize - 1;
+                    const dir = dirFn(u, v);
+                    const len = Math.sqrt(dir[0]*dir[0] + dir[1]*dir[1] + dir[2]*dir[2]);
+                    const dx = dir[0]/len, dy = dir[1]/len, dz = dir[2]/len;
+                    const phi = Math.atan2(dz, dx);
+                    const theta = Math.asin(Math.max(-1, Math.min(1, dy)));
+                    let eu = phi / (2 * Math.PI) + 0.5;
+                    let ev = 0.5 - theta / Math.PI;
+
+                    const sx = eu * srcW;
+                    const sy = ev * srcH;
+                    const sx0 = Math.floor(sx), sy0 = Math.floor(sy);
+                    const fx = sx - sx0, fy = sy - sy0;
+                    const sx1 = (sx0 + 1) % srcW;
+                    const sy1 = Math.min(sy0 + 1, srcH - 1);
+
+                    const i00 = (sy0 * srcW + sx0) * 4;
+                    const i10 = (sy0 * srcW + sx1) * 4;
+                    const i01 = (sy1 * srcW + sx0) * 4;
+                    const i11 = (sy1 * srcW + sx1) * 4;
+
+                    const dstIdx = (y * faceSize + x) * 4;
+                    for (let c = 0; c < 3; c++) {
+                        faceData[dstIdx + c] = Math.round(
+                            srcData[i00+c]*(1-fx)*(1-fy) + srcData[i10+c]*fx*(1-fy) +
+                            srcData[i01+c]*(1-fx)*fy     + srcData[i11+c]*fx*fy
+                        );
+                    }
+                    faceData[dstIdx + 3] = 255;
+                }
+            }
+
+            gl.texImage2D(
+                gl.TEXTURE_CUBE_MAP_POSITIVE_X + face, 0,
+                gl.RGBA, faceSize, faceSize, 0,
+                gl.RGBA, gl.UNSIGNED_BYTE, faceData
+            );
+        }
+
+        gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+
+        return cubemap;
+    }
+
+    // Load a panorama image and convert to cubemap
+    async loadPanorama(waypointId) {
+        const wp = this.waypoints.find(w => w.id === waypointId);
+        if (!wp) return null;
+
+        // Return cached
+        if (this.panoCubemaps[waypointId]) return this.panoCubemaps[waypointId];
+
+        this.loadingPano = waypointId;
+
+        return new Promise((resolve) => {
+            const img = new Image();
+            img.onload = () => {
+                const cubemap = this._equirectToCubemap(img, 1024);
+                this.panoCubemaps[waypointId] = cubemap;
+                this.loadingPano = null;
+                console.log(`Panorama ${wp.file} loaded and converted to cubemap`);
+                resolve(cubemap);
+            };
+            img.onerror = () => {
+                console.error(`Failed to load panorama: ${wp.file}`);
+                this.loadingPano = null;
+                resolve(null);
+            };
+            img.src = `assets/panos/${wp.file}`;
+        });
+    }
+
+    // Check if a waypoint marker is under the mouse (screen-space distance)
+    hitTest(projMatrix, viewMatrix, mouseX, mouseY) {
+        const w = this.canvas.width;
+        const h = this.canvas.height;
+
+        // Mouse in NDC
+        const ndcX = (mouseX / this.canvas.clientWidth) * 2 - 1;
+        const ndcY = 1 - (mouseY / this.canvas.clientHeight) * 2;
+
+        let closest = null;
+        let closestDist = 30; // max pixel distance for hit
+
+        for (const wp of this.waypoints) {
+            // Project waypoint to screen
+            const p = wp.pos;
+            // view * pos
+            const vx = viewMatrix[0]*p[0] + viewMatrix[4]*p[1] + viewMatrix[8]*p[2] + viewMatrix[12];
+            const vy = viewMatrix[1]*p[0] + viewMatrix[5]*p[1] + viewMatrix[9]*p[2] + viewMatrix[13];
+            const vz = viewMatrix[2]*p[0] + viewMatrix[6]*p[1] + viewMatrix[10]*p[2] + viewMatrix[14];
+            const vw = viewMatrix[3]*p[0] + viewMatrix[7]*p[1] + viewMatrix[11]*p[2] + viewMatrix[15];
+
+            if (vw < 0.1) continue; // behind camera
+
+            // proj * view_pos
+            const cx = projMatrix[0]*vx + projMatrix[4]*vy + projMatrix[8]*vz + projMatrix[12]*vw;
+            const cy = projMatrix[1]*vx + projMatrix[5]*vy + projMatrix[9]*vz + projMatrix[13]*vw;
+            const cw = projMatrix[3]*vx + projMatrix[7]*vy + projMatrix[11]*vz + projMatrix[15]*vw;
+
+            if (cw < 0.1) continue;
+
+            const sx = cx / cw;
+            const sy = cy / cw;
+
+            // Distance in pixels
+            const px = (sx - ndcX) * w / 2;
+            const py = (sy - ndcY) * h / 2;
+            const dist = Math.sqrt(px * px + py * py);
+
+            if (dist < closestDist) {
+                closestDist = dist;
+                closest = wp;
+            }
+        }
+
+        return closest;
+    }
+
+    // Enter panorama mode for a waypoint
+    async enterPanorama(waypointId, camera) {
+        const wp = this.waypoints.find(w => w.id === waypointId);
+        if (!wp) return;
+
+        this.currentWaypoint = wp;
+        this.transitioning = true;
+        this.transitionStart = performance.now();
+
+        // Start loading panorama immediately
+        const cubemapPromise = this.loadPanorama(waypointId);
+
+        // Fly camera toward waypoint
+        this._flyTarget = wp.pos;
+        this._flyStartPos = camera.getEyePosition();
+        this._flyStartTarget = [...camera.target];
+        this._flyStartDist = camera.distance;
+        this._flyCamera = camera;
+
+        // Wait for panorama to load
+        await cubemapPromise;
+
+        // Initialize panorama camera direction to match main camera
+        this.panoTheta = camera.theta;
+        this.panoPhi = camera.phi;
+        this.panoFov = 75;
+    }
+
+    exitPanorama() {
+        if (!this.active && !this.transitioning) return;
+        this.active = false;
+        this.transitioning = true;
+        this.transitionStart = performance.now();
+        this._exitingPano = true;
+    }
+
+    // Update transition state. Returns panoOpacity (0 = splats only, 1 = pano only)
+    update(camera) {
+        if (!this.transitioning) return;
+
+        const elapsed = performance.now() - this.transitionStart;
+
+        if (this._exitingPano) {
+            // Fade out panorama
+            const t = Math.min(1, elapsed / this.fadeDuration);
+            this.panoOpacity = 1 - t;
+            if (t >= 1) {
+                this.transitioning = false;
+                this._exitingPano = false;
+                this.panoOpacity = 0;
+                this.currentWaypoint = null;
+            }
+            return;
+        }
+
+        // Entering: fly camera, then fade in panorama
+        if (elapsed < this.transitionDuration) {
+            // Flying phase
+            let t = elapsed / this.transitionDuration;
+            t = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+
+            // Move camera target toward waypoint
+            const wp = this._flyTarget;
+            const st = this._flyStartTarget;
+            camera.target[0] = st[0] + (wp[0] - st[0]) * t;
+            camera.target[1] = st[1] + (wp[1] - st[1]) * t;
+            camera.target[2] = st[2] + (wp[2] - st[2]) * t;
+
+            // Zoom in
+            camera.distance = this._flyStartDist * (1 - t * 0.7);
+            camera._dirty = true;
+        } else {
+            // Crossfade phase
+            const fadeElapsed = elapsed - this.transitionDuration;
+            const t = Math.min(1, fadeElapsed / this.fadeDuration);
+            this.panoOpacity = t;
+
+            if (t >= 1) {
+                this.active = true;
+                this.transitioning = false;
+            }
+        }
+    }
+
+    // Render waypoint markers (call during splat rendering phase)
+    renderMarkers(projMatrix, viewMatrix, time) {
+        if (this.active) return; // hide markers in pano mode
+
+        const gl = this.gl;
+
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+        gl.disable(gl.DEPTH_TEST);
+
+        gl.useProgram(this.markerProgram);
+        gl.uniformMatrix4fv(this.m_projection, false, projMatrix);
+        gl.uniformMatrix4fv(this.m_view, false, viewMatrix);
+        gl.uniform2f(this.m_viewport, this.canvas.width, this.canvas.height);
+
+        const pulse = Math.sin(time * 3) * 0.5 + 0.5;
+
+        // Check hover
+        const hovered = this.hitTest(projMatrix, viewMatrix, this._mouseX, this._mouseY);
+        this.hoveredWaypoint = hovered;
+        this.canvas.style.cursor = hovered ? "pointer" : "";
+
+        gl.bindVertexArray(this.markerVAO);
+
+        for (const wp of this.waypoints) {
+            gl.uniform3f(this.m_markerPos, wp.pos[0], wp.pos[1], wp.pos[2]);
+            gl.uniform1f(this.m_pulse, pulse);
+            gl.uniform1f(this.m_hover, hovered && hovered.id === wp.id ? 1.0 : 0.0);
+            gl.uniform1f(this.m_scale, 1.0);
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+        }
+
+        gl.bindVertexArray(null);
+    }
+
+    // Render panorama overlay (call after splats)
+    renderPanorama(mainProjMatrix, mainViewMatrix) {
+        if (this.panoOpacity <= 0) return;
+        if (!this.currentWaypoint) return;
+
+        const cubemap = this.panoCubemaps[this.currentWaypoint.id];
+        if (!cubemap) return;
+
+        const gl = this.gl;
+
+        // Build panorama view-projection (first-person, rotation only)
+        const aspect = this.canvas.width / this.canvas.height;
+        const fovRad = this.panoFov * Math.PI / 180;
+        const f = 1 / Math.tan(fovRad / 2);
+        const proj = new Float32Array([
+            f / aspect, 0, 0, 0,
+            0, f, 0, 0,
+            0, 0, -1, -1,
+            0, 0, 0, 0,
+        ]);
+
+        // Rotation-only view matrix from pano angles
+        const ct = Math.cos(this.panoTheta), st = Math.sin(this.panoTheta);
+        const cp = Math.cos(this.panoPhi), sp = Math.sin(this.panoPhi);
+
+        const eye = [cp * st, sp, cp * ct];
+        const target = [0, 0, 0];
+        const up = [0, 1, 0];
+
+        // Simple lookAt for rotation only
+        const zx = eye[0], zy = eye[1], zz = eye[2];
+        let len = Math.sqrt(zx*zx + zy*zy + zz*zz);
+        const z = [zx/len, zy/len, zz/len];
+        const xx = up[1]*z[2] - up[2]*z[1];
+        const xy = up[2]*z[0] - up[0]*z[2];
+        const xz = up[0]*z[1] - up[1]*z[0];
+        len = Math.sqrt(xx*xx + xy*xy + xz*xz);
+        const x = [xx/len, xy/len, xz/len];
+        const y = [z[1]*x[2]-z[2]*x[1], z[2]*x[0]-z[0]*x[2], z[0]*x[1]-z[1]*x[0]];
+
+        const view = new Float32Array([
+            x[0], y[0], z[0], 0,
+            x[1], y[1], z[1], 0,
+            x[2], y[2], z[2], 0,
+            0, 0, 0, 1,
+        ]);
+
+        // VP = P * V (using mat4Multiply convention: mat4Multiply(a,b) = b*a)
+        const vp = new Float32Array(16);
+        for (let i = 0; i < 4; i++) {
+            for (let j = 0; j < 4; j++) {
+                vp[i*4+j] = 0;
+                for (let k = 0; k < 4; k++) {
+                    vp[i*4+j] += proj[k*4+j] * view[i*4+k];
+                }
+            }
+        }
+
+        // Invert VP for ray reconstruction
+        const invVP = mat4InvertLocal(vp);
+
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+        gl.disable(gl.DEPTH_TEST);
+
+        gl.useProgram(this.panoProgram);
+        gl.uniformMatrix4fv(this.p_invViewProj, false, invVP);
+        gl.uniform1f(this.p_opacity, this.panoOpacity);
+
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_CUBE_MAP, cubemap);
+        gl.uniform1i(this.p_panoCube, 0);
+
+        gl.bindVertexArray(this.panoVAO);
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+        gl.bindVertexArray(null);
+    }
+
+    // Handle panorama look-around controls
+    handlePanoInput(dx, dy, scrollDelta) {
+        if (!this.active) return;
+        this.panoTheta -= dx * 0.003;
+        this.panoPhi = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01,
+            this.panoPhi + dy * 0.003));
+
+        if (scrollDelta) {
+            this.panoFov = Math.max(30, Math.min(110, this.panoFov + scrollDelta * 0.05));
+        }
+    }
+}
+
+// Local mat4 invert (so module is self-contained)
+function mat4InvertLocal(m) {
+    const inv = new Float32Array(16);
+    const n11=m[0],n21=m[1],n31=m[2],n41=m[3];
+    const n12=m[4],n22=m[5],n32=m[6],n42=m[7];
+    const n13=m[8],n23=m[9],n33=m[10],n43=m[11];
+    const n14=m[12],n24=m[13],n34=m[14],n44=m[15];
+    const t11=n23*n34*n42-n24*n33*n42+n24*n32*n43-n22*n34*n43-n23*n32*n44+n22*n33*n44;
+    const t12=n14*n33*n42-n13*n34*n42-n14*n32*n43+n12*n34*n43+n13*n32*n44-n12*n33*n44;
+    const t13=n13*n24*n42-n14*n23*n42+n14*n22*n43-n12*n24*n43-n13*n22*n44+n12*n23*n44;
+    const t14=n14*n23*n32-n13*n24*n32-n14*n22*n33+n12*n24*n33+n13*n22*n34-n12*n23*n34;
+    const det=n11*t11+n21*t12+n31*t13+n41*t14;
+    if(det===0)return new Float32Array(16);
+    const d=1/det;
+    inv[0]=t11*d;inv[1]=(n24*n33*n41-n23*n34*n41-n24*n31*n43+n21*n34*n43+n23*n31*n44-n21*n33*n44)*d;
+    inv[2]=(n22*n34*n41-n24*n32*n41+n24*n31*n42-n21*n34*n42-n22*n31*n44+n21*n32*n44)*d;
+    inv[3]=(n23*n32*n41-n22*n33*n41-n23*n31*n42+n21*n33*n42+n22*n31*n43-n21*n32*n43)*d;
+    inv[4]=t12*d;inv[5]=(n13*n34*n41-n14*n33*n41+n14*n31*n43-n11*n34*n43-n13*n31*n44+n11*n33*n44)*d;
+    inv[6]=(n14*n32*n41-n12*n34*n41-n14*n31*n42+n11*n34*n42+n12*n31*n44-n11*n32*n44)*d;
+    inv[7]=(n12*n33*n41-n13*n32*n41+n13*n31*n42-n11*n33*n42-n12*n31*n43+n11*n32*n43)*d;
+    inv[8]=t13*d;inv[9]=(n14*n23*n41-n13*n24*n41-n14*n21*n43+n11*n24*n43+n13*n21*n44-n11*n23*n44)*d;
+    inv[10]=(n12*n24*n41-n14*n22*n41+n14*n21*n42-n11*n24*n42-n12*n21*n44+n11*n22*n44)*d;
+    inv[11]=(n13*n22*n41-n12*n23*n41-n13*n21*n42+n11*n23*n42+n12*n21*n43-n11*n22*n43)*d;
+    inv[12]=t14*d;inv[13]=(n13*n24*n31-n14*n23*n31+n14*n21*n33-n11*n24*n33-n13*n21*n34+n11*n23*n34)*d;
+    inv[14]=(n14*n22*n31-n12*n24*n31-n14*n21*n32+n11*n24*n32+n12*n21*n34-n11*n22*n34)*d;
+    inv[15]=(n12*n23*n31-n13*n22*n31+n13*n21*n32-n11*n23*n32-n12*n21*n33+n11*n22*n33)*d;
+    return inv;
+}
