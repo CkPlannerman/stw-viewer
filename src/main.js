@@ -1124,6 +1124,7 @@ function computeBBox(positions) {
 class IntroAnimation {
     constructor() {
         this.active = false;
+        this.reversing = false;
         this.startTime = 0;
         this.swoopDuration = 3.0;
         this.morphDelay = 2.5;
@@ -1133,15 +1134,47 @@ class IntroAnimation {
 
     start(skipDelay = false) {
         this.active = true;
+        this.reversing = false;
         this.startTime = performance.now();
         this.radialProgress = 0;
         this._delay = skipDelay ? 0 : this.morphDelay;
     }
 
+    reverse() {
+        this.reversing = true;
+        this.active = true;
+        this.startTime = performance.now();
+        this._reverseFrom = this.radialProgress;
+    }
+
+    // true when fully morphed and idle (ready for reverse)
+    get isComplete() {
+        return !this.active && !this.reversing && this.radialProgress >= 2.0;
+    }
+
+    // true when reversed back to 0 (ready for play)
+    get isAtStart() {
+        return !this.active && !this.reversing && this.radialProgress <= 0.01;
+    }
+
     update() {
         if (!this.active) return;
-        const elapsed = (performance.now() - this.startTime) / 1000;
 
+        if (this.reversing) {
+            const elapsed = (performance.now() - this.startTime) / 1000;
+            let t = Math.min(1, elapsed / (this.morphDuration * 0.7)); // reverse is a bit faster
+            t = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+            this.radialProgress = this._reverseFrom * (1 - t);
+
+            if (t >= 1) {
+                this.radialProgress = 0;
+                this.active = false;
+                this.reversing = false;
+            }
+            return;
+        }
+
+        const elapsed = (performance.now() - this.startTime) / 1000;
         const delay = this._delay !== undefined ? this._delay : this.morphDelay;
         if (elapsed > delay) {
             const morphElapsed = elapsed - delay;
@@ -1256,8 +1289,9 @@ async function init() {
 
     // UI controls
     playBtn.addEventListener("click", () => {
-        if (intro.radialProgress >= 2) {
-            intro.radialProgress = 0;
+        if (intro.isComplete) {
+            intro.reverse();
+        } else if (intro.isAtStart || (!intro.active && intro.radialProgress <= 0.01)) {
             intro.start(true); // skip delay on manual trigger
         }
     });
@@ -1410,7 +1444,14 @@ async function init() {
         const displayPct = Math.min(100, Math.round(intro.radialProgress / 2.2 * 100));
         morphSlider.value = displayPct;
         morphLabel.textContent = `${displayPct}%`;
-        playBtn.innerHTML = intro.active ? "&#9646;&#9646;" : "&#9654;";
+        // Play/reverse button icon
+        if (intro.active) {
+            playBtn.innerHTML = "&#9646;&#9646;"; // pause while animating
+        } else if (intro.isComplete) {
+            playBtn.innerHTML = "&#9664;"; // reverse arrow when fully morphed
+        } else {
+            playBtn.innerHTML = "&#9654;"; // play arrow when at start
+        }
 
         // Update panorama system
         panoSystem.update(camera);
