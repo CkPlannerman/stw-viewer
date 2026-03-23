@@ -59,6 +59,8 @@ uniform vec2 u_viewport;
 uniform float u_morphProgress;
 uniform float u_splatScale;
 uniform float u_radialProgress;
+uniform vec3 u_hoverPos;       // world-space position of hovered waypoint
+uniform float u_hoverActive;   // 0 = no hover, 1 = hovering
 
 uniform sampler2D u_posTex;
 uniform sampler2D u_scaleTex;
@@ -105,8 +107,17 @@ void main() {
     float localMorph = clamp(u_radialProgress - screenDist * 0.7, 0.0, 1.0);
     localMorph = localMorph * localMorph * (3.0 - 2.0 * localMorph);
 
+    // Local hover shrink: splats near the hovered waypoint get smaller
+    float hoverShrink = 1.0;
+    if (u_hoverActive > 0.5) {
+        float distToHover = distance(a_position, u_hoverPos);
+        float radius = 15.0; // shrink radius in world units
+        float falloff = smoothstep(0.0, radius, distToHover);
+        hoverShrink = mix(0.15, 1.0, falloff); // shrink to 15% at center
+    }
+
     float minScale = 0.001;
-    vec3 morphedScale = mix(vec3(minScale), a_scale * u_splatScale, localMorph);
+    vec3 morphedScale = mix(vec3(minScale), a_scale * u_splatScale * hoverShrink, localMorph);
 
     mat3 R = quatToMat3(a_rotation);
     mat3 S = mat3(
@@ -572,6 +583,8 @@ class SplatRenderer {
         this.radialProgress = 0;
         this.splatScale = 0.6;
         this.dataTexWidth = 4096;
+        this.hoverPos = [0, 0, 0];
+        this.hoverActive = 0;
 
         this._initShaders();
         this._initQuadGeometry();
@@ -610,6 +623,8 @@ class SplatRenderer {
         this.u_colorTex = gl.getUniformLocation(this.program, "u_colorTex");
         this.u_rotTex = gl.getUniformLocation(this.program, "u_rotTex");
         this.u_texWidth = gl.getUniformLocation(this.program, "u_texWidth");
+        this.u_hoverPos = gl.getUniformLocation(this.program, "u_hoverPos");
+        this.u_hoverActive = gl.getUniformLocation(this.program, "u_hoverActive");
         this.a_sortIndex = gl.getAttribLocation(this.program, "a_sortIndex");
         this.a_quadOffset = gl.getAttribLocation(this.program, "a_quadOffset");
     }
@@ -708,6 +723,8 @@ class SplatRenderer {
         gl.uniform1f(this.u_morphProgress, this.morphProgress);
         gl.uniform1f(this.u_splatScale, this.splatScale);
         gl.uniform1f(this.u_radialProgress, this.radialProgress);
+        gl.uniform3f(this.u_hoverPos, this.hoverPos[0], this.hoverPos[1], this.hoverPos[2]);
+        gl.uniform1f(this.u_hoverActive, this.hoverActive);
         gl.uniform1i(this.u_texWidth, this.dataTexWidth);
 
         gl.activeTexture(gl.TEXTURE1);
@@ -1514,10 +1531,16 @@ async function init() {
         // Update panorama system
         panoSystem.update(camera);
 
-        // Smoothly animate splat scale near waypoints on hover
+        // Set localized hover shrink around hovered waypoint
         const hovered = panoSystem.hoveredWaypoint;
-        const targetScale = hovered ? 0.25 : 0.6;
-        renderer.splatScale += (targetScale - renderer.splatScale) * 0.08; // smooth lerp
+        const targetHover = hovered ? 1.0 : 0.0;
+        renderer.hoverActive += (targetHover - renderer.hoverActive) * 0.12; // smooth transition
+        if (hovered) {
+            // Smoothly move hover position
+            renderer.hoverPos[0] += (hovered.pos[0] - renderer.hoverPos[0]) * 0.15;
+            renderer.hoverPos[1] += (hovered.pos[1] - renderer.hoverPos[1]) * 0.15;
+            renderer.hoverPos[2] += (hovered.pos[2] - renderer.hoverPos[2]) * 0.15;
+        }
 
         // Show/hide UI based on pano mode
         const inPano = panoSystem.active || (panoSystem.transitioning && panoSystem.panoOpacity > 0.3);
