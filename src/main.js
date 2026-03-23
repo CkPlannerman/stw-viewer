@@ -1514,10 +1514,27 @@ async function init() {
         // Update panorama system
         panoSystem.update(camera);
 
-        // Show/hide back button
+        // Smoothly animate splat scale near waypoints on hover
+        const hovered = panoSystem.hoveredWaypoint;
+        const targetScale = hovered ? 0.25 : 0.6;
+        renderer.splatScale += (targetScale - renderer.splatScale) * 0.08; // smooth lerp
+
+        // Show/hide UI based on pano mode
+        const inPano = panoSystem.active || (panoSystem.transitioning && panoSystem.panoOpacity > 0.3);
         if (backBtn) {
-            backBtn.style.display = (panoSystem.active || (panoSystem.transitioning && panoSystem.panoOpacity > 0)) ? "flex" : "none";
+            if (inPano) {
+                backBtn.style.display = "flex";
+                requestAnimationFrame(() => { backBtn.style.opacity = "1"; });
+            } else {
+                backBtn.style.opacity = "0";
+                // Hide after transition
+                if (backBtn.style.display === "flex" && !panoSystem.transitioning) {
+                    setTimeout(() => { if (!panoSystem.active) backBtn.style.display = "none"; }, 400);
+                }
+            }
         }
+        uiOverlay.style.opacity = inPano ? "0" : "1";
+        uiOverlay.style.pointerEvents = inPano ? "none" : "auto";
 
         // Throttled sort — max every 200ms, only when camera moves
         if (rawSplatData && !sortPending && !panoSystem.active && (now - lastSortTime > SORT_INTERVAL) &&

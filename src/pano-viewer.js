@@ -72,7 +72,8 @@ void main() {
     float baseSize = 40.0 * u_scale;
     float size = baseSize / dist;
     size = clamp(size, 8.0, 50.0); // min/max pixel size
-    size *= (1.0 + 0.15 * u_pulse); // pulse
+    size *= (1.0 + 0.12 * u_pulse); // gentle pulse
+    size *= (1.0 + 0.35 * u_hover); // expand on hover
 
     vec2 offset = a_pos * size;
     vec2 ndcOffset = offset * 2.0 / u_viewport;
@@ -101,19 +102,23 @@ out vec4 fragColor;
 void main() {
     float dist = length(v_uv);
 
-    // Outer ring
-    float ring = smoothstep(0.9, 0.75, dist) - smoothstep(0.65, 0.5, dist);
+    // Outer ring (thinner, more elegant)
+    float ring = smoothstep(0.92, 0.80, dist) - smoothstep(0.72, 0.62, dist);
     // Inner dot
-    float dot = smoothstep(0.35, 0.2, dist);
-    // Glow
-    float glow = smoothstep(1.0, 0.3, dist) * 0.3;
+    float dot = smoothstep(0.30, 0.15, dist);
+    // Soft glow halo
+    float glow = exp(-dist * dist * 2.5) * 0.35;
+    // Extra hover glow
+    float hoverGlow = v_hover * exp(-dist * dist * 1.5) * 0.4;
 
-    float alpha = max(max(ring, dot), glow);
-    alpha *= (0.7 + 0.3 * v_pulse);
+    float alpha = max(max(ring, dot), glow) + hoverGlow;
+    alpha *= (0.75 + 0.25 * v_pulse);
 
-    // White with slight blue tint, brighter on hover
-    vec3 color = mix(vec3(0.85, 0.9, 1.0), vec3(1.0, 1.0, 1.0), v_hover);
-    alpha = mix(alpha, min(alpha * 1.5, 1.0), v_hover);
+    // White with slight blue tint, gold-white on hover
+    vec3 baseColor = vec3(0.82, 0.88, 1.0);
+    vec3 hoverColor = vec3(1.0, 0.97, 0.90);
+    vec3 color = mix(baseColor, hoverColor, v_hover);
+    alpha = clamp(alpha, 0.0, 1.0);
 
     if (alpha < 0.01) discard;
 
@@ -165,8 +170,10 @@ export class PanoWaypointSystem {
         this.active = false;          // true when in panorama mode
         this.transitioning = false;   // true during fly-to / crossfade
         this.transitionStart = 0;
-        this.transitionDuration = 1500; // ms for camera fly
-        this.fadeDuration = 500;        // ms for crossfade
+        this.transitionDuration = 1500; // ms for camera fly in
+        this.fadeDuration = 600;        // ms for crossfade in
+        this.exitFadeDuration = 800;    // ms for crossfade out (slower)
+        this.exitCameraRestoreDuration = 1200; // ms for camera restore (smooth)
         this.currentWaypoint = null;
         this.hoveredWaypoint = null;
         this.panoOpacity = 0;
@@ -462,9 +469,9 @@ export class PanoWaypointSystem {
         // Wait for panorama to load
         await cubemapPromise;
 
-        // Initialize panorama camera direction to match main camera
+        // Initialize panorama camera: keep horizontal direction but look at horizon
         this.panoTheta = camera.theta;
-        this.panoPhi = camera.phi;
+        this.panoPhi = 0; // horizon level, not inherited from orbit camera
         this.panoFov = 75;
     }
 
@@ -475,6 +482,13 @@ export class PanoWaypointSystem {
         this.transitionStart = performance.now();
         this._exitingPano = true;
         this._exitCamera = camera;
+        // Capture current camera state as starting point for restoration
+        this._exitStartState = {
+            theta: camera.theta,
+            phi: camera.phi,
+            distance: camera.distance,
+            target: [...camera.target],
+        };
     }
 
     // Update transition state. Returns panoOpacity (0 = splats only, 1 = pano only)
@@ -484,30 +498,38 @@ export class PanoWaypointSystem {
         const elapsed = performance.now() - this.transitionStart;
 
         if (this._exitingPano) {
-            // Fade out panorama and restore camera
-            const t = Math.min(1, elapsed / this.fadeDuration);
-            this.panoOpacity = 1 - t;
+            // Fade out panorama (faster)
+            const fadeT = Math.min(1, elapsed / this.exitFadeDuration);
+            // Ease out quad for smooth fade
+            this.panoOpacity = 1 - fadeT * fadeT;
 
-            // Smoothly restore camera position
+            // Smoothly restore camera position (slower, continues after fade)
+            const camT = Math.min(1, elapsed / this.exitCameraRestoreDuration);
+            // Ease in-out cubic for buttery smooth camera movement
+            const easedCamT = camT < 0.5
+                ? 4 * camT * camT * camT
+                : 1 - Math.pow(-2 * camT + 2, 3) / 2;
+
             if (this._savedCamera && this._exitCamera) {
                 const cam = this._exitCamera;
                 const s = this._savedCamera;
-                cam.theta = cam.theta + (s.theta - cam.theta) * t;
-                cam.phi = cam.phi + (s.phi - cam.phi) * t;
-                cam.distance = cam.distance + (s.distance - cam.distance) * t;
-                cam.target[0] = cam.target[0] + (s.target[0] - cam.target[0]) * t;
-                cam.target[1] = cam.target[1] + (s.target[1] - cam.target[1]) * t;
-                cam.target[2] = cam.target[2] + (s.target[2] - cam.target[2]) * t;
+                cam.theta = this._exitStartState.theta + (s.theta - this._exitStartState.theta) * easedCamT;
+                cam.phi = this._exitStartState.phi + (s.phi - this._exitStartState.phi) * easedCamT;
+                cam.distance = this._exitStartState.distance + (s.distance - this._exitStartState.distance) * easedCamT;
+                cam.target[0] = this._exitStartState.target[0] + (s.target[0] - this._exitStartState.target[0]) * easedCamT;
+                cam.target[1] = this._exitStartState.target[1] + (s.target[1] - this._exitStartState.target[1]) * easedCamT;
+                cam.target[2] = this._exitStartState.target[2] + (s.target[2] - this._exitStartState.target[2]) * easedCamT;
                 cam._dirty = true;
             }
 
-            if (t >= 1) {
+            if (camT >= 1) {
                 this.transitioning = false;
                 this._exitingPano = false;
                 this.panoOpacity = 0;
                 this.currentWaypoint = null;
                 this._savedCamera = null;
                 this._exitCamera = null;
+                this._exitStartState = null;
             }
             return;
         }

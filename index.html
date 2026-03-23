@@ -40,6 +40,7 @@
             z-index: 10;
             user-select: none;
             -webkit-user-select: none;
+            transition: opacity 0.4s ease;
         }
 
         .ui-btn {
@@ -273,7 +274,7 @@
 
     <div id="help-hint">Drag to orbit &bull; Scroll to zoom &bull; Right-drag to pan &bull; Click markers for 360 view</div>
 
-    <button id="back-btn" class="ui-btn" style="display:none; position:fixed; top:24px; left:24px; z-index:20; padding:0 16px; height:36px; font-size:13px;">
+    <button id="back-btn" class="ui-btn" style="display:none; position:fixed; top:24px; left:24px; z-index:20; padding:0 16px; height:36px; font-size:13px; opacity:0; transition: opacity 0.4s ease;">
         &larr; Back to 3D
     </button>
 
