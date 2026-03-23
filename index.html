@@ -171,29 +171,32 @@
             pointer-events: none;
             opacity: 0;
             animation: fadeInTitle 1s ease-out 3s forwards;
+            background: rgba(0, 0, 0, 0.65);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            padding: 14px 20px;
         }
         @keyframes fadeInTitle {
             from { opacity: 0; transform: translateY(-10px); }
             to { opacity: 1; transform: translateY(0); }
         }
         #title-overlay h1 {
-            font-size: 20px;
+            font-size: 18px;
             font-weight: 600;
             letter-spacing: 0.5px;
-            text-shadow: 0 2px 12px rgba(0,0,0,0.7);
-            margin-bottom: 4px;
+            margin-bottom: 3px;
         }
         #title-overlay .subtitle {
             font-size: 12px;
-            opacity: 0.6;
-            text-shadow: 0 1px 6px rgba(0,0,0,0.7);
+            opacity: 0.55;
             letter-spacing: 0.3px;
         }
         #title-overlay .branding {
-            font-size: 11px;
-            opacity: 0.35;
-            margin-top: 8px;
-            text-shadow: 0 1px 4px rgba(0,0,0,0.6);
+            font-size: 10px;
+            opacity: 0.3;
+            margin-top: 6px;
             letter-spacing: 2px;
             text-transform: uppercase;
         }
