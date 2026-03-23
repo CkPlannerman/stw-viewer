@@ -483,12 +483,20 @@ export class PanoWaypointSystem {
         this._exitingPano = true;
         this._exitCamera = camera;
         // Capture current camera state as starting point for restoration
+        // Normalize theta difference to shortest rotation path (avoid multi-spin)
+        let startTheta = camera.theta;
+        let targetTheta = this._savedCamera.theta;
+        let diff = targetTheta - startTheta;
+        // Wrap to [-PI, PI]
+        diff = diff - Math.round(diff / (2 * Math.PI)) * 2 * Math.PI;
         this._exitStartState = {
-            theta: camera.theta,
+            theta: startTheta,
             phi: camera.phi,
             distance: camera.distance,
             target: [...camera.target],
         };
+        // Adjust saved theta to be within one rotation of current
+        this._savedCamera.theta = startTheta + diff;
     }
 
     // Update transition state. Returns panoOpacity (0 = splats only, 1 = pano only)
