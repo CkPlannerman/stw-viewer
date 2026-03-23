@@ -91,7 +91,16 @@ void main() {
 
     vec4 camPos = u_view * vec4(a_position, 1.0);
 
-    if (camPos.z > -0.5) {
+    // Early depth cull — behind camera
+    if (camPos.z > -0.3) {
+        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+        v_color = vec4(0.0);
+        return;
+    }
+
+    // Early distance cull — very far splats contribute nothing
+    float dist = -camPos.z;
+    if (dist > 2000.0) {
         gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
         v_color = vec4(0.0);
         return;
@@ -99,6 +108,14 @@ void main() {
 
     vec4 clipPos = u_projection * camPos;
     vec2 ndc = clipPos.xy / clipPos.w;
+
+    // Aggressive frustum cull — skip splats well outside screen
+    if (abs(ndc.x) > 1.3 || abs(ndc.y) > 1.3) {
+        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+        v_color = vec4(0.0);
+        return;
+    }
+
     float screenDist = length(ndc);
 
     float localMorph = clamp(u_radialProgress - screenDist * 0.7, 0.0, 1.0);
@@ -121,11 +138,6 @@ void main() {
 
     float nx = camPos.x / camPos.z;
     float ny = camPos.y / camPos.z;
-    if (abs(nx) > tanFovX * 1.5 || abs(ny) > tanFovY * 1.5) {
-        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
-        v_color = vec4(0.0);
-        return;
-    }
     camPos.x = clamp(nx, -tanFovX, tanFovX) * camPos.z;
     camPos.y = clamp(ny, -tanFovY, tanFovY) * camPos.z;
 
@@ -157,7 +169,7 @@ void main() {
     float r2 = sqrt(lambda2);
 
     float maxRadius = 2.0 * max(r1, r2);
-    maxRadius = min(maxRadius, 100.0);
+    maxRadius = min(maxRadius, 64.0);  // tighter cap for performance
 
     float pointSize = mix(2.0, 0.0, localMorph);
     maxRadius = max(maxRadius, pointSize);
@@ -212,7 +224,7 @@ void main() {
     float sharpness = mix(10.0, 1.2, v_localMorph);
     float gaussian = exp(-0.5 * sharpness * d2);
 
-    if (gaussian < 0.02) discard;
+    if (gaussian < 0.04) discard;  // more aggressive discard for perf
 
     float splatOpacity = mix(1.0, 0.95, v_localMorph);
     float alpha = gaussian * splatOpacity * v_color.a;
@@ -723,7 +735,8 @@ class SplatRenderer {
         gl.uniform1i(this.u_rotTex, 4);
 
         gl.bindVertexArray(this.vao);
-        gl.drawElementsInstanced(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0, this.splatCount);
+        const drawCount = Math.round(this.splatCount * (this.splatFraction || 1.0));
+        gl.drawElementsInstanced(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0, drawCount);
         gl.bindVertexArray(null);
 
         gl.disable(gl.BLEND);
@@ -1206,10 +1219,27 @@ async function init() {
     const dropZone = document.getElementById("drop-zone");
     const fsBtn = document.getElementById("fs-btn");
 
-    const renderScale = 0.85;
+    // Adaptive quality system
+    const quality = {
+        renderScale: 0.85,        // current render resolution multiplier
+        maxRenderScale: 0.85,     // max (desktop quality)
+        minRenderScale: 0.35,     // min (low-end laptop)
+        splatFraction: 1.0,       // fraction of splats to render (0-1)
+        minSplatFraction: 0.3,    // never render fewer than 30% of splats
+        targetFPS: 28,            // target framerate
+        isMoving: false,          // camera in motion?
+        motionRenderScale: 0.6,   // resolution while moving
+        adaptInterval: 500,       // ms between quality adjustments
+        lastAdaptTime: 0,
+        fpsHistory: [],           // rolling FPS samples
+    };
+
     function resize() {
-        canvas.width = Math.round(window.innerWidth * devicePixelRatio * renderScale);
-        canvas.height = Math.round(window.innerHeight * devicePixelRatio * renderScale);
+        const scale = quality.isMoving ?
+            Math.min(quality.renderScale, quality.motionRenderScale) :
+            quality.renderScale;
+        canvas.width = Math.round(window.innerWidth * devicePixelRatio * scale);
+        canvas.height = Math.round(window.innerHeight * devicePixelRatio * scale);
     }
     resize();
     window.addEventListener("resize", resize);
@@ -1225,7 +1255,7 @@ async function init() {
     let lastSortTheta = 0;
     let lastSortPhi = 0;
     let lastFrameTime = performance.now();
-    const SORT_INTERVAL = 200; // ms — throttle sorts
+    let SORT_INTERVAL = 200; // ms — throttle sorts (adapts based on FPS)
 
     // Sort worker — positions stored in worker, only view matrix sent per sort
     const sortWorker = new Worker("src/sort-worker.js");
@@ -1415,6 +1445,7 @@ async function init() {
     let fpsFrameCount = 0;
     let fpsLastTime = performance.now();
     let fpsDisplay = 0;
+    let prevTheta = 0, prevPhi = 0;
 
     // Render loop
     function frame() {
@@ -1430,10 +1461,49 @@ async function init() {
             fpsDisplay = Math.round(fpsFrameCount * 1000 / (now - fpsLastTime));
             fpsLastTime = now;
             fpsFrameCount = 0;
+
+            // Adaptive quality adjustment
+            quality.fpsHistory.push(fpsDisplay);
+            if (quality.fpsHistory.length > 4) quality.fpsHistory.shift();
+            const avgFPS = quality.fpsHistory.reduce((a, b) => a + b, 0) / quality.fpsHistory.length;
+
+            if (now - quality.lastAdaptTime > quality.adaptInterval) {
+                quality.lastAdaptTime = now;
+                if (avgFPS < quality.targetFPS - 5) {
+                    // Struggling — reduce quality
+                    quality.splatFraction = Math.max(quality.minSplatFraction,
+                        quality.splatFraction - 0.1);
+                    quality.renderScale = Math.max(quality.minRenderScale,
+                        quality.renderScale - 0.05);
+                    resize();
+                } else if (avgFPS > quality.targetFPS + 10 && quality.splatFraction < 1.0) {
+                    // Headroom — increase quality
+                    quality.splatFraction = Math.min(1.0, quality.splatFraction + 0.05);
+                    quality.renderScale = Math.min(quality.maxRenderScale,
+                        quality.renderScale + 0.02);
+                    resize();
+                }
+            }
+
+            // Adapt sort interval — sort less often on slow GPUs
+            SORT_INTERVAL = avgFPS < 20 ? 500 : avgFPS < 30 ? 300 : 200;
+
+            const activeSplats = rawSplatData ?
+                Math.round(rawSplatData.count * quality.splatFraction) : 0;
             if (rawSplatData) {
-                infoEl.textContent = `${rawSplatData.count.toLocaleString()} splats | ${fpsDisplay} fps`;
+                infoEl.textContent = `${activeSplats.toLocaleString()} splats | ${fpsDisplay} fps`;
             }
         }
+
+        // Detect camera motion for dynamic resolution
+        const cameraMoved = Math.abs(camera.theta - prevTheta) > 0.001 ||
+                           Math.abs(camera.phi - prevPhi) > 0.001;
+        if (cameraMoved !== quality.isMoving) {
+            quality.isMoving = cameraMoved;
+            resize();
+        }
+        prevTheta = camera.theta;
+        prevPhi = camera.phi;
 
         camera.update(dt);
         intro.update();
@@ -1489,6 +1559,7 @@ async function init() {
 
         const proj = camera.getProjectionMatrix();
         const view = camera.getViewMatrix();
+        renderer.splatFraction = quality.splatFraction;
         renderer.render(proj, view);
 
         // Render waypoint markers (on top of splats)
