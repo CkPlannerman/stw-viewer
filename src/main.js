@@ -570,7 +570,7 @@ class SplatRenderer {
         this.splatCount = 0;
         this.morphProgress = 0;
         this.radialProgress = 0;
-        this.splatScale = 0.6;
+        this.splatScale = 0.45;
         this.dataTexWidth = 4096;
 
         this._initShaders();
