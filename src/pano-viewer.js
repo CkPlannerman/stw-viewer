@@ -67,9 +67,9 @@ void main() {
 
     // Billboard size in pixels, with distance attenuation
     float dist = center.w;
-    float baseSize = 20.0 * u_scale;
+    float baseSize = 40.0 * u_scale;
     float size = baseSize / dist;
-    size = clamp(size, 6.0, 40.0); // min/max pixel size
+    size = clamp(size, 8.0, 50.0); // min/max pixel size
     size *= (1.0 + 0.15 * u_pulse); // pulse
 
     vec2 offset = a_pos * size;
@@ -169,6 +169,9 @@ export class PanoWaypointSystem {
         this.hoveredWaypoint = null;
         this.panoOpacity = 0;
 
+        // Camera state to restore on exit
+        this._savedCamera = null;
+
         // Panorama camera (independent from main camera)
         this.panoTheta = 0;
         this.panoPhi = 0;
@@ -177,6 +180,11 @@ export class PanoWaypointSystem {
         // Loaded panorama cubemaps (cached)
         this.panoCubemaps = {};
         this.loadingPano = null;
+
+        // Hover label element
+        this._label = document.createElement("div");
+        this._label.style.cssText = "position:fixed;pointer-events:none;z-index:15;background:rgba(0,0,0,0.75);color:#fff;font-size:12px;padding:4px 10px;border-radius:4px;white-space:nowrap;display:none;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;backdrop-filter:blur(6px);letter-spacing:0.3px;";
+        document.body.appendChild(this._label);
 
         this._initMarkerRenderer();
         this._initPanoRenderer();
@@ -428,6 +436,14 @@ export class PanoWaypointSystem {
         const wp = this.waypoints.find(w => w.id === waypointId);
         if (!wp) return;
 
+        // Save camera state for restoration on exit
+        this._savedCamera = {
+            theta: camera.theta,
+            phi: camera.phi,
+            distance: camera.distance,
+            target: [...camera.target],
+        };
+
         this.currentWaypoint = wp;
         this.transitioning = true;
         this.transitionStart = performance.now();
@@ -437,7 +453,6 @@ export class PanoWaypointSystem {
 
         // Fly camera toward waypoint
         this._flyTarget = wp.pos;
-        this._flyStartPos = camera.getEyePosition();
         this._flyStartTarget = [...camera.target];
         this._flyStartDist = camera.distance;
         this._flyCamera = camera;
@@ -451,12 +466,13 @@ export class PanoWaypointSystem {
         this.panoFov = 75;
     }
 
-    exitPanorama() {
+    exitPanorama(camera) {
         if (!this.active && !this.transitioning) return;
         this.active = false;
         this.transitioning = true;
         this.transitionStart = performance.now();
         this._exitingPano = true;
+        this._exitCamera = camera;
     }
 
     // Update transition state. Returns panoOpacity (0 = splats only, 1 = pano only)
@@ -466,14 +482,30 @@ export class PanoWaypointSystem {
         const elapsed = performance.now() - this.transitionStart;
 
         if (this._exitingPano) {
-            // Fade out panorama
+            // Fade out panorama and restore camera
             const t = Math.min(1, elapsed / this.fadeDuration);
             this.panoOpacity = 1 - t;
+
+            // Smoothly restore camera position
+            if (this._savedCamera && this._exitCamera) {
+                const cam = this._exitCamera;
+                const s = this._savedCamera;
+                cam.theta = cam.theta + (s.theta - cam.theta) * t;
+                cam.phi = cam.phi + (s.phi - cam.phi) * t;
+                cam.distance = cam.distance + (s.distance - cam.distance) * t;
+                cam.target[0] = cam.target[0] + (s.target[0] - cam.target[0]) * t;
+                cam.target[1] = cam.target[1] + (s.target[1] - cam.target[1]) * t;
+                cam.target[2] = cam.target[2] + (s.target[2] - cam.target[2]) * t;
+                cam._dirty = true;
+            }
+
             if (t >= 1) {
                 this.transitioning = false;
                 this._exitingPano = false;
                 this.panoOpacity = 0;
                 this.currentWaypoint = null;
+                this._savedCamera = null;
+                this._exitCamera = null;
             }
             return;
         }
@@ -509,7 +541,10 @@ export class PanoWaypointSystem {
 
     // Render waypoint markers (call during splat rendering phase)
     renderMarkers(projMatrix, viewMatrix, time) {
-        if (this.active) return; // hide markers in pano mode
+        if (this.active) {
+            this._label.style.display = "none";
+            return; // hide markers in pano mode
+        }
 
         const gl = this.gl;
 
@@ -529,6 +564,20 @@ export class PanoWaypointSystem {
         this.hoveredWaypoint = hovered;
         this.canvas.style.cursor = hovered ? "pointer" : "";
 
+        // Show/hide hover label
+        if (hovered) {
+            // Project hovered waypoint to screen for label position
+            const screenPos = this._projectToScreen(hovered.pos, projMatrix, viewMatrix);
+            if (screenPos) {
+                this._label.style.display = "block";
+                this._label.textContent = `Scan ${hovered.id}`;
+                this._label.style.left = `${screenPos[0] + 15}px`;
+                this._label.style.top = `${screenPos[1] - 12}px`;
+            }
+        } else {
+            this._label.style.display = "none";
+        }
+
         gl.bindVertexArray(this.markerVAO);
 
         for (const wp of this.waypoints) {
@@ -540,6 +589,28 @@ export class PanoWaypointSystem {
         }
 
         gl.bindVertexArray(null);
+    }
+
+    // Project a 3D point to screen coordinates
+    _projectToScreen(pos, projMatrix, viewMatrix) {
+        const p = pos;
+        const vx = viewMatrix[0]*p[0] + viewMatrix[4]*p[1] + viewMatrix[8]*p[2] + viewMatrix[12];
+        const vy = viewMatrix[1]*p[0] + viewMatrix[5]*p[1] + viewMatrix[9]*p[2] + viewMatrix[13];
+        const vz = viewMatrix[2]*p[0] + viewMatrix[6]*p[1] + viewMatrix[10]*p[2] + viewMatrix[14];
+        const vw = viewMatrix[3]*p[0] + viewMatrix[7]*p[1] + viewMatrix[11]*p[2] + viewMatrix[15];
+        if (vw < 0.1) return null;
+
+        const cx = projMatrix[0]*vx + projMatrix[4]*vy + projMatrix[8]*vz + projMatrix[12]*vw;
+        const cy = projMatrix[1]*vx + projMatrix[5]*vy + projMatrix[9]*vz + projMatrix[13]*vw;
+        const cw = projMatrix[3]*vx + projMatrix[7]*vy + projMatrix[11]*vz + projMatrix[15]*vw;
+        if (cw < 0.1) return null;
+
+        const ndcX = cx / cw;
+        const ndcY = cy / cw;
+
+        const screenX = (ndcX * 0.5 + 0.5) * this.canvas.clientWidth;
+        const screenY = (1 - (ndcY * 0.5 + 0.5)) * this.canvas.clientHeight;
+        return [screenX, screenY];
     }
 
     // Render panorama overlay (call after splats)
@@ -556,11 +627,13 @@ export class PanoWaypointSystem {
         const aspect = this.canvas.width / this.canvas.height;
         const fovRad = this.panoFov * Math.PI / 180;
         const f = 1 / Math.tan(fovRad / 2);
+        const near = 0.1, far = 100.0;
+        const nf = 1 / (near - far);
         const proj = new Float32Array([
             f / aspect, 0, 0, 0,
             0, f, 0, 0,
-            0, 0, -1, -1,
-            0, 0, 0, 0,
+            0, 0, (far + near) * nf, -1,
+            0, 0, 2 * far * near * nf, 0,
         ]);
 
         // Rotation-only view matrix from pano angles

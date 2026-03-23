@@ -1428,11 +1428,11 @@ async function init() {
     // Back button / Escape to exit pano
     const backBtn = document.getElementById("back-btn");
     if (backBtn) {
-        backBtn.addEventListener("click", () => panoSystem.exitPanorama());
+        backBtn.addEventListener("click", () => panoSystem.exitPanorama(camera));
     }
     window.addEventListener("keydown", (e) => {
         if (e.key === "Escape" && (panoSystem.active || panoSystem.transitioning)) {
-            panoSystem.exitPanorama();
+            panoSystem.exitPanorama(camera);
         }
     });
 
